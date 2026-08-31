@@ -1,0 +1,15 @@
+*.iml
+.gradle
+/local.properties
+.idea/*
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+.kotlin/*
+app/release/*
+.reasonix/*
+reasonix.toml
+tools/__pycache__/*

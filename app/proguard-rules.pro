@@ -1,0 +1,8 @@
+-optimizationpasses 5
+-repackageclasses 'a'
+-allowaccessmodification
+-mergeinterfacesaggressively
+-overloadaggressively
+-keepattributes !*
+-dontusemixedcaseclassnames
+-dontpreverify
