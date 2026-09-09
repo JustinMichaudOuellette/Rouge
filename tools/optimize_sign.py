@@ -13,6 +13,11 @@ runtime behaviour:
     platformBuildVersion*, extractNativeLibs) and rebuilds the string pool as
     UTF-8 -- same element tree and runtime attributes; disable with
     --no-manifest-golf
+  * slims R8/D8 metadata strings in classes.dex (tools/dex_golf.py): rewrites
+    the unreferenced "~~R8{...}" provenance marker and the "r8-map-id-*" class
+    SourceFile to compressible runs, keeping every string's length, offset and
+    sorted-pool position so the dex structure is untouched; disable with
+    --no-dex-golf
   * keeps resources.arsc STORED when it carries resources, but drops it when
     it is only an empty stub (< 100 B, zero entries): if the manifest's icon
     and theme reference framework resources (@android:...), Android resolves
@@ -34,6 +39,8 @@ Options:
   --no-zipalign          skip zipalign (debugging)
   --no-manifest-golf     keep the compiled AndroidManifest.xml as aapt2 made it
                          (default: re-encode it smaller; see tools/manifest_golf.py)
+  --no-dex-golf          keep the R8/D8 metadata strings in classes.dex
+                         (default: zero them; see tools/dex_golf.py)
 
 Output goes through <output.apk> only after every step succeeds.
 Requires the python `cryptography` package for --sign.
@@ -48,11 +55,13 @@ import tempfile
 import zipfile
 
 import manifest_golf  # same-directory helper; see tools/manifest_golf.py
+import dex_golf  # same-directory helper; see tools/dex_golf.py
 
 APP_METADATA = "META-INF/com/android/build/gradle/app-metadata.properties"
 ARSC = "resources.arsc"
 STORED = {ARSC}
 MANIFEST = "AndroidManifest.xml"
+DEX = "classes.dex"
 
 
 def sdk_dir():
@@ -80,7 +89,7 @@ def newest_build_tools(sdk):
     return os.path.join(bt, sorted(os.listdir(bt), key=key)[-1])
 
 
-def optimize(in_apk, out_apk, golf_manifest=True):
+def optimize(in_apk, out_apk, golf_manifest=True, golf_dex=True):
     with zipfile.ZipFile(in_apk) as zin, \
             zipfile.ZipFile(out_apk, "w", compresslevel=9) as zout:
         for info in zin.infolist():
@@ -101,6 +110,14 @@ def optimize(in_apk, out_apk, golf_manifest=True):
                 else:
                     print(f"  {info.filename}: {info.file_size} B raw "
                           "(manifest golf skipped: rewrite failed or no win)")
+            if info.filename == DEX and golf_dex:
+                golfed = dex_golf.golf_dex(data)
+                if golfed != data:
+                    print(f"  {info.filename}: R8 metadata strings slimmed "
+                          "(marker + map-id SourceFile, see tools/dex_golf.py)")
+                    data = golfed
+                else:
+                    print(f"  {info.filename}: no R8 metadata to slim")
             new = zipfile.ZipInfo(info.filename, date_time=(1980, 1, 1, 0, 0, 0))
             if info.filename in STORED or info.filename.endswith("/"):
                 new.compress_type = zipfile.ZIP_STORED
@@ -128,6 +145,8 @@ def main():
     ap.add_argument("--no-zipalign", action="store_true")
     ap.add_argument("--no-manifest-golf", action="store_true",
                     help="keep the compiled AndroidManifest.xml as aapt2 made it")
+    ap.add_argument("--no-dex-golf", action="store_true",
+                    help="keep R8/D8 metadata strings in classes.dex")
     ap.add_argument("--build-tools", help="override build-tools dir")
     args = ap.parse_args()
 
@@ -144,7 +163,8 @@ def main():
     try:
         step1 = os.path.join(tmp, "optimized.apk")
         print(f"[1/3] repack {args.input} -> {step1}")
-        optimize(args.input, step1, golf_manifest=not args.no_manifest_golf)
+        optimize(args.input, step1, golf_manifest=not args.no_manifest_golf,
+                 golf_dex=not args.no_dex_golf)
 
         step2 = step1
         if not args.no_zipalign:

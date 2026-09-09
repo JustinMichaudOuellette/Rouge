@@ -1,12 +1,12 @@
 # Rouge
 
 **A full-screen red Android app that turns horizontal touch/drag into a
-brightness control — shipped as a ~2.3 KB signed APK.**
+brightness control — shipped as a ~2.1 KB signed APK.**
 
 `ca.justinmo.r` · minSdk 37 · targetSdk 37 · zero dependencies
 
 Rouge is both a tiny utility and an exercise in aggressive APK size golf:
-the release APK you install is a hand-tuned ~2.3 KB, built with standard
+the release APK you install is a hand-tuned ~2.1 KB, built with standard
 Android tooling plus a byte-tight, pure-Python APK Signature Scheme v2
 signer — inspired by [ApkGolf](https://github.com/fractalwrench/ApkGolf),
 but without sacrificing the launcher icon, the UI, or any functionality.
@@ -30,18 +30,18 @@ Measured on this repository (`gradlew :app:assembleRelease` + `tools/release.py`
 |---|---|
 | Typical Gradle+AppCompat hello world | ~1.5 MB |
 | This app, plain `assembleRelease` (unsigned) | 2,967 B |
-| After `tools/optimize_sign.py` (optimized, unsigned) | 1,742 B |
-| **Signed release APK (this repo's default)** | **2,310 B** |
+| After `tools/optimize_sign.py` (optimized, unsigned) | 1,578 B |
+| **Signed release APK (this repo's default)** | **2,145 B** |
 
 A stock `apksigner` run would pad the signing block and the central
 directory to 4 KB boundaries, adding several KB of dead weight to an APK
 this size. The in-repo signer (`tools/v2sign.py`) does not.
 
-What's inside the 2,310 B — and note what's *not* there:
+What's inside the 2,145 B — and note what's *not* there:
 
 | Component | Bytes (approx.) |
 |---|---|
-| `classes.dex` (R8-minified, deflated) | ~985 |
+| `classes.dex` (R8-minified, deflated, metadata slimmed) | ~821 |
 | `AndroidManifest.xml` (compiled, deflated, golfed) | ~523 |
 | ~~`resources.arsc`~~ | **none** |
 | v2 signing block (tight, EC P-256 + minimal cert) | ~585 |
@@ -49,7 +49,9 @@ What's inside the 2,310 B — and note what's *not* there:
 
 The manifest golfing step (technique 8) is what takes the compiled
 `AndroidManifest.xml` from 1,908 B raw (715 B deflated) down to 1,184 B raw
-(523 B deflated) before signing.
+(523 B deflated) before signing.  The dex-golf step (technique 9) then slims
+R8/D8's own metadata strings in `classes.dex`, cutting the deflated entry
+from 985 B to 821 B.
 
 There is **no `resources.arsc` at all**: the icon references a framework
 color (`@android:color/holo_red_light`), the theme is the framework
@@ -66,6 +68,7 @@ tools/
   release.py                  one-shot: key → build → optimize+sign → adb install + launch
   optimize_sign.py            post-build repack + zipalign + sign
   manifest_golf.py            re-encodes the compiled AndroidManifest.xml smaller
+  dex_golf.py                 zeroes R8/D8 metadata strings in classes.dex
   v2sign.py                   pure-Python APK Signature Scheme v2 signer
 ```
 
@@ -108,7 +111,7 @@ adb install -r app-release-final.apk
 Outputs land in `app/build/outputs/apk/release/`:
 
 - `app-release-unsigned.apk` — plain Gradle output
-- `app-release-final.apk` — optimized + v2-signed APK (2,310 B)
+- `app-release-final.apk` — optimized + v2-signed APK (2,145 B)
 
 Launch it with `adb shell am start -n ca.justinmo.r/a.a` (or just run
 `tools/release.py`, which installs and launches it for you).
@@ -176,6 +179,17 @@ A checklist of the techniques used (full details live in each file):
    bytes. The tool falls back to the untouched manifest unless its own
    parse-and-compare self-check passes, and the result is verified by a real
    install on each release run.
+9. **R8/D8 metadata is slimmed in `classes.dex`** (`tools/dex_golf.py`,
+   wired into `optimize_sign.py`; disable with `--no-dex-golf`). R8 embeds an
+   unreferenced ~200 B provenance marker (`~~R8{...}`, no flag disables it)
+   and AGP 8.12+ writes a 74-char `r8-map-id-*` as the class SourceFile. The
+   optimizer rewrites both strings to compressible runs (e.g.
+   `r8-map-id-aaa...`) -- same length, same pool position, so the dex
+   structure and ART's verifier are untouched (verified with build-tools
+   dexdump) -- and refreshes the dex header checksums.  The deflated
+   `classes.dex` entry drops 985 B → 821 B.  Runtime behaviour is unchanged;
+   the SourceFile a crash trace shows is a junk run instead of the map-id
+   hash.
 
 Nothing here changes behaviour or the package name — the app on your screen
 is byte-for-byte the same logic as the plain Gradle build. (The launcher
