@@ -1,12 +1,12 @@
 # Rouge
 
 **A full-screen red Android app that turns horizontal touch/drag into a
-brightness control — shipped as a ~2.1 KB signed APK.**
+brightness control — shipped as a ~2.0 KB signed APK.**
 
 `ca.justinmo.r` · minSdk 37 · targetSdk 37 · zero dependencies
 
 Rouge is both a tiny utility and an exercise in aggressive APK size golf:
-the release APK you install is a hand-tuned ~2.1 KB, built with standard
+the release APK you install is a hand-tuned ~2.0 KB, built with standard
 Android tooling plus a byte-tight, pure-Python APK Signature Scheme v2
 signer — inspired by [ApkGolf](https://github.com/fractalwrench/ApkGolf),
 but without sacrificing the launcher icon, the UI, or any functionality.
@@ -30,28 +30,34 @@ Measured on this repository (`gradlew :app:assembleRelease` + `tools/release.py`
 |---|---|
 | Typical Gradle+AppCompat hello world | ~1.5 MB |
 | This app, plain `assembleRelease` (unsigned) | 2,967 B |
-| After `tools/optimize_sign.py` (optimized, unsigned) | 1,578 B |
-| **Signed release APK (this repo's default)** | **2,145 B** |
+| After `tools/optimize_sign.py` (optimized, unsigned) | 1,488 B |
+| **Signed release APK (with Zopfli, technique 10)** | **2,055 B** |
+| Signed release APK (Zopfli not installed: zlib -9 only) | 2,118 B |
+
+The last two rows are the same pipeline; Zopfli is optional, so a machine
+without it builds the 2,118 B APK. Signing is the other jitter source: the
+ECDSA signature is DER-encoded and its length varies by a byte or two
+between runs, so a signed build measures 2,055 B ±1 B.
 
 A stock `apksigner` run would pad the signing block and the central
 directory to 4 KB boundaries, adding several KB of dead weight to an APK
 this size. The in-repo signer (`tools/v2sign.py`) does not.
 
-What's inside the 2,145 B — and note what's *not* there:
+What's inside the 2,055 B — and note what's *not* there:
 
 | Component | Bytes (approx.) |
 |---|---|
-| `classes.dex` (R8-minified, deflated, metadata slimmed) | ~821 |
-| `AndroidManifest.xml` (compiled, deflated, golfed) | ~523 |
+| `classes.dex` (R8-minified, deflated, metadata slimmed) | ~762 |
+| `AndroidManifest.xml` (compiled, deflated, golfed) | ~492 |
 | ~~`resources.arsc`~~ | **none** |
-| v2 signing block (tight, EC P-256 + minimal cert) | ~585 |
-| ZIP headers / central directory (incl. 4-byte zipalign padding) | ~215 |
+| v2 signing block (tight, EC P-256 + minimal cert) | ~567 |
+| ZIP headers + central directory + EOCD (2 entries, no padding) | ~234 |
 
 The manifest golfing step (technique 8) is what takes the compiled
-`AndroidManifest.xml` from 1,908 B raw (715 B deflated) down to 1,184 B raw
-(523 B deflated) before signing.  The dex-golf step (technique 9) then slims
-R8/D8's own metadata strings in `classes.dex`, cutting the deflated entry
-from 985 B to 821 B.
+`AndroidManifest.xml` from 1,908 B raw down to 1,184 B raw before signing.
+The dex-golf step (technique 9) then slims R8/D8's own metadata strings in
+`classes.dex`.  Technique 10 then deflates both entries as far as they will
+go, landing the two entries at 762 B and 492 B.
 
 There is **no `resources.arsc` at all**: the icon references a framework
 color (`@android:color/holo_red_light`), the theme is the framework
@@ -79,6 +85,9 @@ tools/
   (path goes in `local.properties` → `sdk.dir`, or `ANDROID_HOME`)
 - **Python 3.9+** with the [`cryptography`](https://pypi.org/project/cryptography/)
   package (key generation and signing; the repack step alone needs no extras)
+  and, optionally, [`zopfli`](https://pypi.org/project/zopfli/) for the
+  smallest possible DEFLATE (see technique 10; without it the build still
+  works, just ~63 B larger — 2,118 B instead of 2,055 B)
 
 ## Build & install
 
@@ -111,7 +120,8 @@ adb install -r app-release-final.apk
 Outputs land in `app/build/outputs/apk/release/`:
 
 - `app-release-unsigned.apk` — plain Gradle output
-- `app-release-final.apk` — optimized + v2-signed APK (2,145 B)
+- `app-release-final.apk` — optimized + v2-signed APK (2,055 B; 2,118 B
+  without the optional Zopfli)
 
 Launch it with `adb shell am start -n ca.justinmo.r/a.a` (or just run
 `tools/release.py`, which installs and launches it for you).
@@ -171,7 +181,7 @@ A checklist of the techniques used (full details live in each file):
    `platformBuildVersionCode/Name`, `extractNativeLibs`) that nothing reads at
    runtime. The optimizer drops those and re-encodes the identical element
    tree with a deduplicated UTF-8 string pool (raw 1,908 B → 1,184 B, so the
-   deflated entry in the signed APK drops from 715 B to 523 B).
+   deflated entry in the signed APK drops from 715 B to 492 B).
    aapt2 writes manifest pools as UTF-16 to dodge an old OEM device bug; the
    UTF-8 flag is standard and fine on modern Android, but if a device ever
    fails to parse the golfed manifest, set `UTF8_POOL = False` in
@@ -187,9 +197,23 @@ A checklist of the techniques used (full details live in each file):
    `r8-map-id-aaa...`) -- same length, same pool position, so the dex
    structure and ART's verifier are untouched (verified with build-tools
    dexdump) -- and refreshes the dex header checksums.  The deflated
-   `classes.dex` entry drops 985 B → 821 B.  Runtime behaviour is unchanged;
-   the SourceFile a crash trace shows is a junk run instead of the map-id
-   hash.
+   `classes.dex` entry drops 985 B → 762 B (with technique 10).  Runtime
+   behaviour is unchanged; the SourceFile a crash trace shows is a junk run
+   instead of the map-id hash.
+10. **Every deflated entry is compressed with Zopfli**
+   (`tools/optimize_sign.py`; needs the optional `pip install zopfli`,
+   disable with `--no-zopfli`). Zopfli emits plain DEFLATE, so Android
+   decompresses it unchanged — it simply searches longer for a smaller
+   stream than zlib. Together with the DEFLATE level fix below it takes the
+   signed APK from 2,147 B to 2,055 B (~4.3%): `classes.dex` 821 → 762 B and
+   `AndroidManifest.xml` 523 → 492 B deflated (the level fix is worth ~29 B
+   of that, Zopfli the other ~63 B; both are measured, and the Zopfli search
+   parameters are tuned in `optimize_sign.py`).  Most of the remaining bytes
+   are the v2 signing block and ZIP headers, which compression cannot touch.
+   The level fix matters because CPython ignores `ZipFile(compresslevel=...)`
+   when `writestr()` is handed a `ZipInfo`, so entries used to fall back to
+   zlib's default level 6 — and it applies even without Zopfli installed
+   (2,147 B → 2,118 B on its own).
 
 Nothing here changes behaviour or the package name — the app on your screen
 is byte-for-byte the same logic as the plain Gradle build. (The launcher

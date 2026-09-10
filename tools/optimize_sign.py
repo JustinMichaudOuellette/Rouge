@@ -6,8 +6,10 @@ without changing the application package name, the launcher icon, or any
 runtime behaviour:
 
   * drops META-INF/com/android/build/gradle/app-metadata.properties
-  * deflates classes.dex / AndroidManifest.xml at maximum compression
-    (Gradle stores classes.dex uncompressed)
+  * deflates classes.dex / AndroidManifest.xml as small as the compressor can
+    go: zlib -9, or Zopfli when the optional `zopfli` package is installed
+    (~4% off the final APK; ApkGolf-style, run before signing); disable Zopfli
+    with --no-zopfli.  (Gradle stores classes.dex uncompressed.)
   * re-encodes AndroidManifest.xml smaller (tools/manifest_golf.py): drops
     aapt2-injected informational attributes (versionName, compileSdkVersion,
     platformBuildVersion*, extractNativeLibs) and rebuilds the string pool as
@@ -41,11 +43,14 @@ Options:
                          (default: re-encode it smaller; see tools/manifest_golf.py)
   --no-dex-golf          keep the R8/D8 metadata strings in classes.dex
                          (default: zero them; see tools/dex_golf.py)
+  --no-zopfli            deflate with zlib -9 only (skip Zopfli even if installed)
 
 Output goes through <output.apk> only after every step succeeds.
-Requires the python `cryptography` package for --sign.
+Requires the python `cryptography` package for --sign, and optionally the
+`zopfli` package (pip install zopfli) for the smallest possible DEFLATE.
 """
 import argparse
+import contextlib
 import os
 import re
 import shutil
@@ -53,9 +58,21 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+import zlib
 
 import manifest_golf  # same-directory helper; see tools/manifest_golf.py
 import dex_golf  # same-directory helper; see tools/dex_golf.py
+
+try:  # optional: Zopfli beats zlib -9 by ~3-6% on these payloads (ApkGolf-style)
+    import zopfli.zlib as _zopfli_zlib
+except ImportError:  # not installed -- zlib -9 is still used
+    _zopfli_zlib = None
+
+# Both tuned by measurement on the two payloads here: 1000 iterations and a
+# single deflate block are the smallest streams zopfli.zlib will produce
+# (762 B + 492 B); more iterations or more blocks give nothing back.
+ZOPFLI_ITERATIONS = 1000
+ZOPFLI_BLOCKSPLITTING_MAX = 1
 
 APP_METADATA = "META-INF/com/android/build/gradle/app-metadata.properties"
 ARSC = "resources.arsc"
@@ -89,9 +106,66 @@ def newest_build_tools(sdk):
     return os.path.join(bt, sorted(os.listdir(bt), key=key)[-1])
 
 
-def optimize(in_apk, out_apk, golf_manifest=True, golf_dex=True):
+def _raw_deflate(data, allow_zopfli):
+    """Smallest raw DEFLATE stream for `data`: zlib -9, or Zopfli when available."""
+    comp = zlib.compressobj(9, zlib.DEFLATED, -15)
+    best = comp.compress(data) + comp.flush()
+    if allow_zopfli and _zopfli_zlib is not None:
+        # zopfli.zlib frames its output with a 2-byte header + adler32; a ZIP
+        # entry wants the bare DEFLATE stream in between.
+        z = _zopfli_zlib.compress(
+            data, numiterations=ZOPFLI_ITERATIONS,
+            blocksplittingmax=ZOPFLI_BLOCKSPLITTING_MAX)[2:-4]
+        if len(z) < len(best):
+            best = z
+    return best
+
+
+class _BestDeflater:
+    """zlib.compressobj-compatible shim that emits _raw_deflate() on flush()."""
+
+    def __init__(self, allow_zopfli):
+        self._allow_zopfli = allow_zopfli
+        self._buf = bytearray()
+
+    def compress(self, data):
+        self._buf += data
+        return b""
+
+    def flush(self, mode=None):
+        return _raw_deflate(bytes(self._buf), self._allow_zopfli)
+
+
+@contextlib.contextmanager
+def _best_deflate(allow_zopfli=True):
+    """Deflate every ZIP entry as small as possible while this block runs.
+
+    Also sidesteps a CPython subtlety: when writestr() is handed a ZipInfo,
+    ZipFile(compresslevel=...) is ignored and entries fall back to zlib's
+    default level 6 -- this shim is what actually puts them at level 9.
+    """
+    original = getattr(zipfile, "_get_compressor", None)
+    if original is None:  # unknown CPython: keep zipfile's own deflate
+        print("  note: zipfile._get_compressor unavailable; using default deflate")
+        yield
+        return
+
+    def patched(compress_type, compresslevel=None):
+        if compress_type == zipfile.ZIP_DEFLATED:
+            return _BestDeflater(allow_zopfli)
+        return original(compress_type, compresslevel)
+
+    zipfile._get_compressor = patched
+    try:
+        yield
+    finally:
+        zipfile._get_compressor = original
+
+
+def optimize(in_apk, out_apk, golf_manifest=True, golf_dex=True, use_zopfli=True):
     with zipfile.ZipFile(in_apk) as zin, \
-            zipfile.ZipFile(out_apk, "w", compresslevel=9) as zout:
+            zipfile.ZipFile(out_apk, "w", compresslevel=9) as zout, \
+            _best_deflate(allow_zopfli=use_zopfli):
         for info in zin.infolist():
             if info.filename == APP_METADATA:
                 print(f"  drop {info.filename} ({info.file_size} B)")
@@ -147,6 +221,8 @@ def main():
                     help="keep the compiled AndroidManifest.xml as aapt2 made it")
     ap.add_argument("--no-dex-golf", action="store_true",
                     help="keep R8/D8 metadata strings in classes.dex")
+    ap.add_argument("--no-zopfli", action="store_true",
+                    help="deflate with zlib -9 only (skip Zopfli even if installed)")
     ap.add_argument("--build-tools", help="override build-tools dir")
     args = ap.parse_args()
 
@@ -164,7 +240,7 @@ def main():
         step1 = os.path.join(tmp, "optimized.apk")
         print(f"[1/3] repack {args.input} -> {step1}")
         optimize(args.input, step1, golf_manifest=not args.no_manifest_golf,
-                 golf_dex=not args.no_dex_golf)
+                 golf_dex=not args.no_dex_golf, use_zopfli=not args.no_zopfli)
 
         step2 = step1
         if not args.no_zipalign:
