@@ -189,7 +189,13 @@ def _semantic_dump(data):
 
 
 def rewrite(strings, map_rids, nodes):
-    """Rebuild pool/map/nodes, dropping informational attributes."""
+    """Rebuild pool/map/nodes, dropping informational attributes.
+
+    The XML namespace nodes and the attributes' namespace references are kept:
+    dropping them looks like ~48 free bytes (the 'android' prefix and the
+    schema URI leave the pool too) but Android's AXML parser then rejects the
+    APK with "Corrupt XML binary file" -- measured on Android 17.
+    """
     keep = []          # (rid, name) for the resource map, in original order
     old_to_new = {}
     pos = 0

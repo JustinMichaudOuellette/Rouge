@@ -12,7 +12,12 @@ resulting signing block is byte-tight instead of apksigner's padded one:
                       pre-block length)  -- exactly what apksig verifies.
 
 Supported keys: EC P-256 (alg 0x0201, ECDSA w/ SHA-256), RSA <= 3072 bit
-(alg 0x0101, PKCS#1 v1.5 w/ SHA-256). SHA-512 variants are not implemented.
+(alg 0x0103, PKCS#1 v1.5 w/ SHA-256). SHA-512 variants are not implemented.
+
+ECDSA signatures are DER SEQUENCES of two INTEGERs, so their length varies by
+a couple of bytes per signature; `_sign_best()` re-rolls the (random) nonce
+until the encoding is as short as P-256 allows (70 B, sometimes 69) rather
+than accepting whatever the first attempt produced.
 """
 import hashlib
 import struct
@@ -20,6 +25,16 @@ import struct
 V2_BLOCK_ID = 0x7109871a
 MAGIC = b"APK Sig Block 42"
 CHUNK = 1024 * 1024
+
+# Signature algorithm IDs (AOSP apksig SignatureAlgorithm / Android
+# ApkSignatureSchemeV2Verifier).  Note 0x0101 is RSA-PSS, not PKCS#1 v1.5 --
+# PKCS#1 v1.5 with SHA-256 is 0x0103.
+ALG_ECDSA_SHA256 = 0x0201
+ALG_RSA_PKCS1_SHA256 = 0x0103
+
+# Shortest DER ECDSA signature P-256 can produce (2 + 34 + 34).
+MIN_ECDSA_DER = 70
+SIGN_TRIES = 64
 
 
 def _u32(n):
@@ -89,18 +104,37 @@ def pick_algorithm(key):
     if isinstance(key, ec.EllipticCurvePrivateKey):
         if key.curve.name != "secp256r1":
             raise ValueError("only EC P-256 supported (got %s)" % key.curve.name)
-        return 0x0201  # ECDSA with SHA-256
+        return ALG_ECDSA_SHA256
     if isinstance(key, rsa.RSAPrivateKey):
         if key.key_size > 3072:
             raise ValueError("RSA > 3072 bit needs SHA-512 (not implemented)")
-        return 0x0101  # RSASSA-PKCS1-v1_5 with SHA-256
+        return ALG_RSA_PKCS1_SHA256
     raise ValueError("unsupported key type %s" % type(key).__name__)
+
+
+def _sign_best(private_key, data, tries=SIGN_TRIES):
+    """Signature over `data`, re-rolled for the shortest DER encoding.
+
+    Only ECDSA benefits (its DER length depends on the random nonce); RSA
+    PKCS#1 output is always the modulus size, so it is signed once.
+    """
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec, padding
+
+    if isinstance(private_key, ec.EllipticCurvePrivateKey):
+        best = None
+        for _ in range(max(1, tries)):
+            sig = private_key.sign(data, ec.ECDSA(hashes.SHA256()))
+            if best is None or len(sig) < len(best):
+                best = sig
+            if len(best) <= MIN_ECDSA_DER:
+                break
+        return best
+    return private_key.sign(data, padding.PKCS1v15(), hashes.SHA256())
 
 
 def v2_sign(apk_bytes, private_key, cert_der):
     """Return a v2-signed APK (byte-tight signing block, no padding)."""
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import ec, padding
     from cryptography.hazmat.primitives.serialization import (
         Encoding, PublicFormat)
 
@@ -127,10 +161,7 @@ def v2_sign(apk_bytes, private_key, cert_der):
     certs_field = _lp_seq([cert_der])
     signed_data = _lp_seq([digests_field, certs_field, b"", b""])  # attrs empty
 
-    if alg_id == 0x0201:
-        signature = private_key.sign(signed_data, ec.ECDSA(hashes.SHA256()))
-    else:
-        signature = private_key.sign(signed_data, padding.PKCS1v15(), hashes.SHA256())
+    signature = _sign_best(private_key, signed_data)
     sigs_field = _lp_pairs([(alg_id, signature)])
     pub_spki = private_key.public_key().public_bytes(
         Encoding.DER, PublicFormat.SubjectPublicKeyInfo)

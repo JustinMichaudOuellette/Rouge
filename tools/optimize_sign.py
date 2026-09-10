@@ -15,11 +15,11 @@ runtime behaviour:
     platformBuildVersion*, extractNativeLibs) and rebuilds the string pool as
     UTF-8 -- same element tree and runtime attributes; disable with
     --no-manifest-golf
-  * slims R8/D8 metadata strings in classes.dex (tools/dex_golf.py): rewrites
-    the unreferenced "~~R8{...}" provenance marker and the "r8-map-id-*" class
-    SourceFile to compressible runs, keeping every string's length, offset and
-    sorted-pool position so the dex structure is untouched; disable with
-    --no-dex-golf
+  * slims R8/D8 metadata strings out of classes.dex (tools/dex_golf.py): the
+    unreferenced "~~R8{...}" provenance marker and the "r8-map-id-*" class
+    SourceFile are replaced by the shortest string that keeps the pool
+    sorted, and every offset the (shorter) string data invalidates is fixed
+    up -- no index in the file is renumbered; disable with --no-dex-golf
   * keeps resources.arsc STORED when it carries resources, but drops it when
     it is only an empty stub (< 100 B, zero entries): if the manifest's icon
     and theme reference framework resources (@android:...), Android resolves
@@ -29,7 +29,13 @@ runtime behaviour:
   * zipaligns (4-byte) and, with --sign, applies a byte-tight APK v2-only
     signature in pure Python (tools/v2sign.py, modeled on AOSP apksig) --
     ApkGolf-style: EC/RSA key, no v1 JAR signing, no reserved 4096-byte
-    signing-block padding that apksigner adds.
+    signing-block padding that apksigner adds, and the ECDSA nonce re-rolled
+    for the shortest DER signature
+
+The certificate that goes into the signing block is the keystore's own, so a
+build never changes the app's signing identity.  `tools/release.py --recert`
+re-issues it as a 257 B minimal certificate (tools/mincert.py) if you want the
+bytes -- that is a one-time identity change.
 
 Usage:
   python optimize_sign.py <input.apk> <output.apk> [options]
@@ -44,6 +50,8 @@ Options:
   --no-dex-golf          keep the R8/D8 metadata strings in classes.dex
                          (default: zero them; see tools/dex_golf.py)
   --no-zopfli            deflate with zlib -9 only (skip Zopfli even if installed)
+  --work-dir <dir>       put (and keep) the intermediate APKs here instead of
+                         in a temporary directory that is deleted afterwards
 
 Output goes through <output.apk> only after every step succeeds.
 Requires the python `cryptography` package for --sign, and optionally the
@@ -68,11 +76,13 @@ try:  # optional: Zopfli beats zlib -9 by ~3-6% on these payloads (ApkGolf-style
 except ImportError:  # not installed -- zlib -9 is still used
     _zopfli_zlib = None
 
-# Both tuned by measurement on the two payloads here: 1000 iterations and a
-# single deflate block are the smallest streams zopfli.zlib will produce
-# (762 B + 492 B); more iterations or more blocks give nothing back.
+# Both tuned by measurement on the two payloads here (dex 1360 B, manifest
+# 1184 B): 1000 iterations with blocksplittingmax=2 gives 735 B + 492 B, which
+# is the smallest total zopfli.zlib will produce.  The old value of 1 -- a
+# single deflate block -- was the optimum for the pre-dex-golf 1632 B dex and
+# now costs 6 B, so re-measure if the payloads change shape.
 ZOPFLI_ITERATIONS = 1000
-ZOPFLI_BLOCKSPLITTING_MAX = 1
+ZOPFLI_BLOCKSPLITTING_MAX = 2
 
 APP_METADATA = "META-INF/com/android/build/gradle/app-metadata.properties"
 ARSC = "resources.arsc"
@@ -187,11 +197,12 @@ def optimize(in_apk, out_apk, golf_manifest=True, golf_dex=True, use_zopfli=True
             if info.filename == DEX and golf_dex:
                 golfed = dex_golf.golf_dex(data)
                 if golfed != data:
-                    print(f"  {info.filename}: R8 metadata strings slimmed "
-                          "(marker + map-id SourceFile, see tools/dex_golf.py)")
+                    print(f"  {info.filename}: {len(data)} B raw -> "
+                          f"{len(golfed)} B (R8/D8 metadata strings removed, "
+                          "see tools/dex_golf.py)")
                     data = golfed
                 else:
-                    print(f"  {info.filename}: no R8 metadata to slim")
+                    print(f"  {info.filename}: no R8 metadata to remove")
             new = zipfile.ZipInfo(info.filename, date_time=(1980, 1, 1, 0, 0, 0))
             if info.filename in STORED or info.filename.endswith("/"):
                 new.compress_type = zipfile.ZIP_STORED
@@ -224,6 +235,9 @@ def main():
     ap.add_argument("--no-zopfli", action="store_true",
                     help="deflate with zlib -9 only (skip Zopfli even if installed)")
     ap.add_argument("--build-tools", help="override build-tools dir")
+    ap.add_argument("--work-dir",
+                    help="keep intermediates in this directory instead of a "
+                         "temporary one")
     args = ap.parse_args()
 
     if not os.path.exists(args.input):
@@ -235,7 +249,10 @@ def main():
         sys.exit("cannot locate build-tools; pass --build-tools")
     zipalign = os.path.join(bt, "zipalign" + (".exe" if os.name == "nt" else ""))
 
-    tmp = tempfile.mkdtemp(prefix="rouge-opt-")
+    tmp = args.work_dir or tempfile.mkdtemp(prefix="rouge-opt-")
+    if args.work_dir:
+        os.makedirs(tmp, exist_ok=True)
+        print(f"[work] intermediates in {tmp}")
     try:
         step1 = os.path.join(tmp, "optimized.apk")
         print(f"[1/3] repack {args.input} -> {step1}")
@@ -262,6 +279,7 @@ def main():
                 sys.exit("keystore contains no private key + certificate")
             cert_der = cert.public_bytes(
                 __import__("cryptography").hazmat.primitives.serialization.Encoding.DER)
+            print(f"  certificate: {len(cert_der)} B (the keystore's own)")
             # sign_apk_file writes only to args.output on success
             v2sign.sign_apk_file(final, args.output, key, cert_der)
             print(f"  signed -> {args.output}")
@@ -270,7 +288,8 @@ def main():
 
         print(f"OK -> {args.output} ({os.path.getsize(args.output)} bytes)")
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        if not args.work_dir:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

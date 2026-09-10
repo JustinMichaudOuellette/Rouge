@@ -9,6 +9,7 @@ result on a connected device via adb, and launches the app.
 Usage:
   python tools/release.py [--ks <file>] [--ks-pass <pass>] [--apk-out <file>]
                           [--no-build] [--no-install] [--package <id>]
+                          [--recert]
 
 Defaults:
   keystore : <repo>/build/keys/release.p12        (auto-generated if absent)
@@ -16,18 +17,22 @@ Defaults:
   apk out  : <repo>/app/build/outputs/apk/release/app-release-final.apk
 
 Notes:
-  * The auto-generated certificate is minimal (no X.509 extensions) to keep
-    the APK signing block small. Signing identity = the whole keystore:
-    Android treats a re-issued certificate as a different signer, so change
-    the certificate only for fresh installs (uninstall required), never for
-    published updates.
+  * The certificate is built by hand (tools/mincert.py): a version 1, no
+    extensions, one-character-CommonName, UTCTime certificate.  It is 257 B
+    where Android Studio/keytool would produce 700-900 B and
+    cryptography.CertificateBuilder ~270 B, and it is half of the v2 signing
+    block, so those bytes land directly in the APK.
+  * Signing identity = the certificate, not the key: Android treats a
+    re-issued certificate as a different signer, so change it only for fresh
+    installs (uninstall required), never for published updates.  --recert
+    re-issues an existing keystore's certificate as the minimal one.
   * If a brand-new keystore is generated, the signing identity is new, so
     previously installed builds must be uninstalled first.
   * Requires: JDK (gradle), python 'cryptography' package, Android SDK
     (zipalign/apksigner/adb) reachable via local.properties.
 """
 import argparse
-import datetime
+import hashlib
 import os
 import re
 import secrets
@@ -37,11 +42,11 @@ import subprocess
 import sys
 
 from cryptography import x509
-from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.serialization import (
     BestAvailableEncryption, pkcs12)
-from cryptography.x509.oid import NameOID
+
+import mincert
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
@@ -106,15 +111,33 @@ def tool(name, *dirs):
 
 
 def _minimal_cert(key):
-    """Self-signed EC certificate with no X.509 extensions (smallest DER)."""
-    now = datetime.datetime.now(datetime.timezone.utc)
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Rouge")])
-    return (x509.CertificateBuilder()
-            .subject_name(name).issuer_name(name)
-            .public_key(key.public_key()).serial_number(1)
-            .not_valid_before(now - datetime.timedelta(days=1))
-            .not_valid_after(now + datetime.timedelta(days=10000))
-            .sign(key, hashes.SHA256()))
+    """The smallest self-signed certificate the signer can carry.
+
+    Built by hand (tools/mincert.py) rather than with CertificateBuilder: a
+    version 1 certificate with no extensions, a one-character CommonName, no
+    optional fields and UTCTime validity is 257 B instead of ~270-900 B, which
+    is 9-30 B off the signed APK (the certificate is roughly half of the v2
+    signing block).
+    """
+    der = mincert.build_best(key, cn=b"R")
+    return x509.load_der_x509_certificate(der)
+
+
+def recert(ks, ks_pass):
+    """Re-issue the keystore's certificate as a minimal one."""
+    _key, old_der = mincert.load(ks, ks_pass)
+    _old, new_der = mincert.recert_keystore(ks, ks_pass, cn=b"R")
+    if new_der == old_der:
+        print(f"[cert] already minimal ({len(new_der)} B)")
+        return
+    print(f"[cert] re-issued: {len(old_der)} B -> {len(new_der)} B "
+          f"({len(old_der) - len(new_der)} B off every future build)")
+    print("       SHA-256 was "
+          f"{hashlib.sha256(old_der).hexdigest()[:16]}... now "
+          f"{hashlib.sha256(new_der).hexdigest()[:16]}...")
+    print("       NOTE: a re-issued certificate is a NEW signing identity --")
+    print("       an existing install must be uninstalled before it can be "
+          "replaced.")
 
 
 def ensure_keystore(ks, ks_pass):
@@ -158,11 +181,19 @@ def main():
     ap.add_argument("--package", default=None, help="override applicationId")
     ap.add_argument("--no-build", action="store_true")
     ap.add_argument("--no-install", action="store_true")
+    ap.add_argument("--recert", action="store_true",
+                    help="re-issue the keystore certificate as a minimal one "
+                         "(smaller APK, but a NEW signing identity: an "
+                         "existing install must be uninstalled first)")
     args = ap.parse_args()
 
     pkg = args.package or application_id()
     ks, ks_pass = ensure_keystore(args.ks, args.ks_pass)
     ks_pass = load_keystore_password(ks, ks_pass)
+    if args.recert:
+        recert(ks, ks_pass)
+        if args.no_build and args.no_install:
+            return
 
     if not args.no_build:
         print("[1/4] building release APK")
