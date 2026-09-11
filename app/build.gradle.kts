@@ -14,18 +14,6 @@ android {
     versionName = "1"
   }
 
-  androidResources {
-    localeFilters += "en"
-  }
-
-  buildFeatures {
-    buildConfig = false
-    resValues = false
-    aidl = false
-    renderScript = false
-    shaders = false
-  }
-
   buildTypes {
     release {
       isMinifyEnabled = true
@@ -41,22 +29,4 @@ android {
     sourceCompatibility = JavaVersion.VERSION_1_8
     targetCompatibility = JavaVersion.VERSION_1_8
   }
-  packaging {
-    resources {
-      excludes += "META-INF/**"
-    }
-  }
-}
-
-androidComponents {
-  onVariants(selector().all()) { variant ->
-    variant.packaging.resources.excludes.add("META-INF/com/android/build/gradle/app-metadata.properties")
-  }
-}
-
-tasks.matching { it.name.contains("appMetadata", ignoreCase = true) }.configureEach {
-  enabled = false
-}
-
-dependencies {
 }
