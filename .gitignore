@@ -14,3 +14,12 @@ app/release/*
 .reasonix/*
 reasonix.toml
 tools/__pycache__/*
+
+# The signing identity: never commit the keystore or its password, wherever
+# they are put. The matching <keystore>.sha256 fingerprint file is public --
+# it is what the Play Console asks for -- and is meant to be committed.
+*.p12
+*.p12.pass
+*.jks
+*.jks.pass
+*.keystore

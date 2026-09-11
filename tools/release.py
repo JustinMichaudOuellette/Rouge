@@ -11,12 +11,23 @@ Usage:
                           [--no-build] [--no-install] [--package <id>]
                           [--recert]
 
-Defaults:
-  keystore : <repo>/build/keys/release.p12        (auto-generated if absent)
-  password : from --ks-pass, else <keystore>.pass (written when generated)
-  apk out  : <repo>/rouge_final.apk                (override with --apk-out)
+Default paths (all in the repository root):
+  keystore  : <repo>/release.p12                    (auto-generated if absent)
+  password  : from --ks-pass, else <keystore>.pass  (written when generated)
+  cert SHA-256 : <keystore>.sha256                  (rewritten every run)
+  apk out   : <repo>/rouge_final.apk                (override with --apk-out)
 
 Notes:
+  * The keystore lives in the repository root, not under build/: `gradlew
+    clean` (or Android Studio's Clean Project) deletes build/, and losing the
+    signing key means never being able to update an installed or published
+    copy again.  A keystore found at the old build/keys/release.p12 path is
+    moved to the root rather than replaced by a freshly generated key.
+  * <keystore>.sha256 holds the certificate's SHA-256 fingerprint exactly as
+    the Play Console wants it (uppercase hex, colon-separated, no "SHA256:"
+    prefix), so it can be pasted straight in.  It is rewritten on every run
+    because --recert re-issues the certificate and the fingerprint *is* the
+    signing identity.
   * The Gradle input is whatever `:app:assembleRelease` produced, found
     through AGP's app/build/outputs/apk/release/output-metadata.json -- the
     release build type carries a signingConfig (the debug key), so that file
@@ -47,6 +58,7 @@ import subprocess
 import sys
 
 from cryptography import x509
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.serialization import (
     BestAvailableEncryption, pkcs12)
@@ -56,7 +68,10 @@ import mincert
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
 OPTIMIZE_SIGN = os.path.join(TOOLS, "optimize_sign.py")
-DEFAULT_KS = os.path.join(ROOT, "build", "keys", "release.p12")
+# In the repository root, not under build/: `gradlew clean` deletes build/,
+# and the signing identity cannot be regenerated.
+DEFAULT_KS = os.path.join(ROOT, "release.p12")
+LEGACY_KS = os.path.join(ROOT, "build", "keys", "release.p12")
 DEFAULT_OUT = os.path.join(ROOT, "rouge_final.apk")
 RELEASE_DIR = os.path.join(ROOT, "app", "build", "outputs", "apk", "release")
 
@@ -190,6 +205,28 @@ def recert(ks, ks_pass):
           "replaced.")
 
 
+def adopt_legacy_keystore(ks):
+    """Move a keystore still sitting at the old build/keys path into place.
+
+    The default used to be <repo>/build/keys/release.p12, and build/ is
+    deleted by `gradlew clean` (and by Android Studio's Clean Project) -- so
+    the app's signing identity could be wiped by a routine build command.
+    Generating a fresh key there would silently change that identity, which
+    is the one thing in this repo that cannot be regenerated: treat a
+    keystore found at the old path as the real key and move it (with its
+    .pass) rather than making a new one.
+    """
+    if ks != DEFAULT_KS or os.path.exists(ks) or not os.path.exists(LEGACY_KS):
+        return
+    os.makedirs(os.path.dirname(ks) or ".", exist_ok=True)
+    shutil.move(LEGACY_KS, ks)
+    if os.path.exists(LEGACY_KS + ".pass"):
+        shutil.move(LEGACY_KS + ".pass", ks + ".pass")
+    print(f"[key] moved the existing keystore {LEGACY_KS} -> {ks}")
+    print("      (build/ is deleted by `gradlew clean`; the signing identity "
+          "is not regenerable)")
+
+
 def ensure_keystore(ks, ks_pass):
     if os.path.exists(ks):
         return ks, ks_pass
@@ -222,6 +259,39 @@ def load_keystore_password(ks, ks_pass):
     sys.exit(f"no password: pass --ks-pass or create {pass_file}")
 
 
+def keystore_certificate(ks, ks_pass):
+    """The certificate that identifies this app to Android and to Play."""
+    with open(ks, "rb") as fh:
+        _key, cert, _extra = pkcs12.load_key_and_certificates(
+            fh.read(), ks_pass.encode())
+    if cert is None:
+        sys.exit(f"keystore contains no certificate: {ks}")
+    return cert
+
+
+def write_fingerprint(ks, ks_pass):
+    """Write <keystore>.sha256: the certificate's SHA-256 fingerprint.
+
+    The file holds exactly what the Play Console's certificate fingerprint
+    field accepts -- uppercase hex, colon-separated, no "SHA256:" prefix and
+    nothing else on the line -- so it can be copied straight out of the file.
+
+    It is rewritten on every run because the fingerprint *is* the signing
+    identity: a re-issued certificate (--recert) or a replacement keystore
+    changes it, and a stale fingerprint file is worse than none.  The file is
+    public information (unlike the keystore and its password, which
+    .gitignore keeps out of the repository).
+    """
+    fingerprint = keystore_certificate(ks, ks_pass).fingerprint(hashes.SHA256())
+    text = ":".join(f"{byte:02X}" for byte in fingerprint)
+    path = ks + ".sha256"
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text + "\n")
+    print(f"[cert] SHA-256 fingerprint: {text}")
+    print(f"[cert] written to {path} (paste into the Play Console)")
+    return text
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -240,12 +310,17 @@ def main():
     args = ap.parse_args()
 
     pkg = args.package or application_id()
+    adopt_legacy_keystore(args.ks)
     ks, ks_pass = ensure_keystore(args.ks, args.ks_pass)
     ks_pass = load_keystore_password(ks, ks_pass)
     if args.recert:
         recert(ks, ks_pass)
-        if args.no_build and args.no_install:
-            return
+    # After any certificate change (a new keystore or --recert), and before the
+    # --recert-only exit below: the fingerprint file has to match the
+    # certificate that will sign the APK.
+    write_fingerprint(ks, ks_pass)
+    if args.recert and args.no_build and args.no_install:
+        return
 
     if not args.no_build:
         print("[1/4] building release APK", flush=True)
