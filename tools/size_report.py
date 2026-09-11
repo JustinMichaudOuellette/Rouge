@@ -11,7 +11,7 @@ Two things this project needs whenever it changes shape:
     re-tuned once tools/dex_golf.py cut it to 1360 B.
 
 Usage:
-  python tools/size_report.py [<apk>]        # default: app-release-final.apk
+  python tools/size_report.py [<apk>]        # default: rouge_final.apk (repo root)
   python tools/size_report.py <apk> --sweep  # add the Zopfli parameter sweep
 """
 import argparse
@@ -24,7 +24,7 @@ import zlib
 MAGIC = b"APK Sig Block 42"
 DEFAULT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "app", "build", "outputs", "apk", "release", "app-release-final.apk")
+    "rouge_final.apk")
 
 
 def _u16(d, o):

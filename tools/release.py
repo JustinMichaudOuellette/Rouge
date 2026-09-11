@@ -14,7 +14,7 @@ Usage:
 Defaults:
   keystore : <repo>/build/keys/release.p12        (auto-generated if absent)
   password : from --ks-pass, else <keystore>.pass (written when generated)
-  apk out  : <repo>/app/build/outputs/apk/release/app-release-final.apk
+  apk out  : <repo>/rouge_final.apk                (override with --apk-out)
 
 Notes:
   * The certificate is built by hand (tools/mincert.py): a version 1, no
@@ -52,8 +52,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
 OPTIMIZE_SIGN = os.path.join(TOOLS, "optimize_sign.py")
 DEFAULT_KS = os.path.join(ROOT, "build", "keys", "release.p12")
-DEFAULT_OUT = os.path.join(
-    ROOT, "app", "build", "outputs", "apk", "release", "app-release-final.apk")
+DEFAULT_OUT = os.path.join(ROOT, "rouge_final.apk")
 
 
 def sh(cmd, **kw):

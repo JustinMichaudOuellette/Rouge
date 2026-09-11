@@ -116,9 +116,9 @@ Manual equivalent:
 ./gradlew :app:assembleRelease
 python tools/optimize_sign.py \
     app/build/outputs/apk/release/app-release-unsigned.apk \
-    app-release-final.apk \
+    rouge_final.apk \
     --sign --ks your.p12 --ks-pass secret
-adb install -r app-release-final.apk
+adb install -r rouge_final.apk
 ```
 
 `optimize_sign.py` also takes `--work-dir DIR` to keep the intermediate
@@ -126,11 +126,13 @@ repacked/aligned APKs for inspection instead of deleting them, and switches
 for turning each golfing step off (`--no-dex-golf`, `--no-manifest-golf`,
 `--no-zopfli`) so a suspect build can be bisected.
 
-Outputs land in `app/build/outputs/apk/release/`:
+Outputs are:
 
-- `app-release-unsigned.apk` — plain Gradle output
-- `app-release-final.apk` — optimized + v2-signed APK (2,014 B; 2,063 B
-  without the optional Zopfli)
+- `app/build/outputs/apk/release/app-release-unsigned.apk` — plain Gradle
+  output
+- `rouge_final.apk`, in the repository root — optimized + v2-signed APK
+  (2,014 B; 2,063 B without the optional Zopfli). This is the file
+  `tools/release.py` writes by default; `--apk-out FILE` sends it elsewhere
 
 Launch it with `adb shell am start -n ca.justinmo.r/a.a` (or just run
 `tools/release.py`, which installs and launches it for you).

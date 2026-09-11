@@ -10,6 +10,7 @@
 local.properties
 .kotlin/*
 app/release/*
+/rouge_final.apk
 .reasonix/*
 reasonix.toml
 tools/__pycache__/*
