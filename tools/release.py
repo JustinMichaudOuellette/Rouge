@@ -219,8 +219,13 @@ def main():
         bt = newest_build_tools(sdk)
         apksigner = tool("apksigner", bt)
         if apksigner:
-            subprocess.run([apksigner, "verify", "--print-certs", args.apk_out],
-                           check=True)
+            # The shipped APK declares no minSdkVersion (the manifest golf step
+            # drops it -- see tools/manifest_golf.py), so apksigner falls back
+            # to minSdk 1 and then demands a v1 JAR signature this APK
+            # deliberately does not have ("Missing META-INF/MANIFEST.MF").
+            # Pin the min SDK so it verifies the v2 scheme that is present.
+            subprocess.run([apksigner, "verify", "--min-sdk-version", "37",
+                            "--print-certs", args.apk_out], check=True)
     else:
         print("  (SDK not found; skipped apksigner verify)")
 

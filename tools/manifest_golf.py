@@ -12,10 +12,17 @@ small most of the bytes are encoding overhead, not information:
       <application>  extractNativeLibs="false"   (no native libs exist)
 
 golf_manifest() re-encodes the manifest with the *identical* element tree and
-runtime attributes (versionCode, uses-sdk, icon/label/theme, exported, and the
-MAIN/LAUNCHER intent filters are all kept), but:
+runtime attributes (versionCode, targetSdkVersion, icon/label/theme, exported,
+and the MAIN/LAUNCHER intent filters are all kept), but:
 
   * drops the informational attributes listed above,
+  * drops <uses-sdk android:minSdkVersion> as well (see DROP_MIN_SDK below).
+    That one is *not* informational: PackageManager reads it at install time to
+    refuse devices below the value, so dropping it is a real, if small,
+    semantic change -- the APK then declares no API floor and install falls
+    back to the platform default.  Worth 44 B raw / 14 B deflated here.
+    targetSdkVersion, which drives runtime compatibility behaviour, is kept, so
+    this does not change how the app runs,
   * rebuilds the string pool as UTF-8, deduplicated, containing only strings
     the tree references.  The first n slots keep the framework attribute names
     in resource-map order (pool index == resource-map index, exactly the
@@ -24,10 +31,13 @@ MAIN/LAUNCHER intent filters are all kept), but:
     (only TYPE_STRING data indices are remapped to the new pool).
 
 Correctness guard: the output is re-parsed and its semantic dump (tree +
-attribute namespaces/names/values) must equal the input's dump with the same
-informational attributes removed.  On any mismatch, unexpected structure, or
-parse failure golf_manifest() returns the input unchanged rather than risking
-an uninstallable APK.
+attribute namespaces/names/values) must equal the input's dump after the same
+dropped attributes are removed from both.  On any mismatch, unexpected
+structure, or parse failure golf_manifest() returns the input unchanged rather
+than risking an uninstallable APK.  Note the guard cannot cover the
+minSdkVersion drop -- it applies the same predicate to both dumps, so a
+deliberate removal is invisible to it by construction; that drop is verified
+by installing the result on a device, not by the dump comparison.
 
 Note on UTF-8: aapt2 writes manifest string pools as UTF-16 on purpose
 (tools/aapt2/format/binary/XmlFlattener.cpp cites an OEM-device memory bug
@@ -52,6 +62,15 @@ DROP_RIDS = {
 }
 # Same, but these have no framework resource ID (plain string attr names).
 DROP_NAMES = {"platformBuildVersionCode", "platformBuildVersionName"}
+
+# <uses-sdk android:minSdkVersion="N">.  Unlike the attributes above, this one
+# IS read (at install time, to reject devices below N), so dropping it is a
+# genuine semantic change: the APK declares no API floor and PackageManager
+# falls back to its platform default.  On by default because the drop is free
+# at runtime -- targetSdkVersion, which is what actually selects compatibility
+# behaviours, is untouched.  Set DROP_MIN_SDK = False to keep the floor.
+MINSDK_RID = 0x0101020c
+DROP_MIN_SDK = True
 
 UTF8_POOL = True  # see module note
 
@@ -155,10 +174,15 @@ def _attr_key(strings, map_rids, ns, nm, is_map):
     return rid, nm_s
 
 
+def _drop_rid(rid):
+    """True when a framework-attribute RID should be removed from the manifest."""
+    return rid in DROP_RIDS or (DROP_MIN_SDK and rid == MINSDK_RID)
+
+
 def _drop_attr(strings, map_rids, attr):
     ns, nm, is_map, _raw, _typ, _dat = attr
     rid, nm_s = _attr_key(strings, map_rids, ns, nm, is_map)
-    return (rid in DROP_RIDS) or (nm_s in DROP_NAMES)
+    return _drop_rid(rid) or (nm_s in DROP_NAMES)
 
 
 def _semantic_dump(data):
@@ -200,7 +224,7 @@ def rewrite(strings, map_rids, nodes):
     old_to_new = {}
     pos = 0
     for i, rid in enumerate(map_rids):
-        if rid in DROP_RIDS:
+        if _drop_rid(rid):
             continue
         old_to_new[i] = pos
         keep.append((rid, strings[i]))

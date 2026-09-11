@@ -3,7 +3,7 @@
 **A full-screen red Android app that turns horizontal touch/drag into a
 brightness control — shipped as a ~2.0 KB signed APK.**
 
-`ca.justinmo.r` · minSdk 37 · targetSdk 37 · zero dependencies
+`ca.justinmo.r` · targetSdk 37 · no minSdk in the shipped APK (technique 8) · zero dependencies
 
 Rouge is both a tiny utility and an exercise in aggressive APK size golf:
 the release APK you install is a hand-tuned ~2.0 KB, built with standard
@@ -30,36 +30,36 @@ Measured on this repository (`gradlew :app:assembleRelease` + `tools/release.py`
 |---|---|
 | Typical Gradle+AppCompat hello world | ~1.5 MB |
 | This app, plain `assembleRelease` (unsigned) | 2,967 B |
-| After `tools/optimize_sign.py` (optimized, unsigned) | 1,461 B |
-| **Signed release APK (with Zopfli, technique 10)** | **2,028 B** |
-| Signed release APK (Zopfli not installed: zlib -9 only) | 2,078 B |
-| Signed with a minimal certificate (`--recert`, technique 11) | 2,019 B |
+| After `tools/optimize_sign.py` (optimized, unsigned) | 1,447 B |
+| **Signed release APK (with Zopfli, technique 10)** | **2,014 B** |
+| Signed release APK (Zopfli not installed: zlib -9 only) | 2,063 B |
+| Signed with a minimal certificate (`--recert`, technique 11) | 2,005 B |
 
 The last two rows are the same pipeline with one ingredient missing, so a
-machine without Zopfli builds the 2,078 B APK. Signing is the other jitter
+machine without Zopfli builds the 2,063 B APK. Signing is the other jitter
 source: the ECDSA signature is DER-encoded and its length varies by a byte or
-two, so a signed build measures 2,028 B ±1 B.
+two, so a signed build measures 2,014 B ±1 B.
 
 A stock `apksigner` run would pad the signing block and the central
 directory to 4 KB boundaries, adding several KB of dead weight to an APK
 this size. The in-repo signer (`tools/v2sign.py`) does not.
 
-What's inside the 2,028 B — and note what's *not* there:
+What's inside the 2,014 B — and note what's *not* there:
 
 | Component | Bytes |
 |---|---|
 | `classes.dex` (R8-minified, metadata stripped, deflated) | 735 |
-| `AndroidManifest.xml` (compiled, deflated, golfed) | 492 |
+| `AndroidManifest.xml` (compiled, deflated, golfed) | 478 |
 | ~~`resources.arsc`~~ | **none** |
 | v2 signing block (tight, EC P-256 + 233–266 B cert) | 567 |
 | ZIP local headers + central directory + EOCD (2 entries) | 234 |
 
 The manifest golfing step (technique 8) is what takes the compiled
-`AndroidManifest.xml` from 1,908 B raw down to 1,184 B raw before signing.
+`AndroidManifest.xml` from 1,908 B raw down to 1,140 B raw before signing.
 The dex-golf step (technique 9) removes R8/D8's own metadata strings from
 `classes.dex`, taking it from 1,632 B raw to 1,360 B. Technique 10 then
 deflates both entries as far as they will go, landing the two entries at
-735 B and 492 B.
+735 B and 478 B.
 
 There is **no `resources.arsc` at all**: the icon references a framework
 color (`@android:color/holo_red_light`), the theme is the framework
@@ -90,7 +90,7 @@ tools/
   package (key generation and signing; the repack step alone needs no extras)
   and, optionally, [`zopfli`](https://pypi.org/project/zopfli/) for the
   smallest possible DEFLATE (see technique 10; without it the build still
-  works, just 50 B larger — 2,078 B instead of 2,028 B)
+  works, just 49 B larger — 2,063 B instead of 2,014 B)
 
 ## Build & install
 
@@ -129,7 +129,7 @@ for turning each golfing step off (`--no-dex-golf`, `--no-manifest-golf`,
 Outputs land in `app/build/outputs/apk/release/`:
 
 - `app-release-unsigned.apk` — plain Gradle output
-- `app-release-final.apk` — optimized + v2-signed APK (2,028 B; 2,078 B
+- `app-release-final.apk` — optimized + v2-signed APK (2,014 B; 2,063 B
   without the optional Zopfli)
 
 Launch it with `adb shell am start -n ca.justinmo.r/a.a` (or just run
@@ -192,16 +192,37 @@ A checklist of the techniques used (full details live in each file):
    stores the manifest's string pool as UTF-16 and injects informational
    attributes (`versionName`, `compileSdkVersion`, `compileSdkVersionCodename`,
    `platformBuildVersionCode/Name`, `extractNativeLibs`) that nothing reads at
-   runtime. The optimizer drops those and re-encodes the identical element
-   tree with a deduplicated UTF-8 string pool (raw 1,908 B → 1,184 B, so the
-   deflated entry in the signed APK drops from 715 B to 492 B).
+   runtime. It also drops `android:minSdkVersion`, which *is* read (at install
+   time, to refuse older devices) and so is a real semantic change — see the
+   note below. It then re-encodes the identical element tree with a
+   deduplicated UTF-8 string pool (raw 1,908 B → 1,140 B, so the deflated
+   entry in the signed APK drops from 715 B to 478 B).
    aapt2 writes manifest pools as UTF-16 to dodge an old OEM device bug; the
    UTF-8 flag is standard and fine on modern Android, but if a device ever
    fails to parse the golfed manifest, set `UTF8_POOL = False` in
    `tools/manifest_golf.py` — the attribute drops still save most of the
    bytes. The tool falls back to the untouched manifest unless its own
-   parse-and-compare self-check passes, and the result is verified by a real
-   install on each release run.
+   parse-and-compare self-check passes — but that check applies the same drop
+   list to both sides, so it cannot cover the deliberate `minSdkVersion`
+   removal; a real install on each release run covers that instead.
+   `targetSdkVersion`, which actually selects runtime compatibility
+   behaviour, is always kept.
+
+   **About the dropped `minSdkVersion`.** This is the one change here that
+   alters what the APK *declares* rather than only how it is encoded, so it is
+   worth being explicit: with no `<uses-sdk android:minSdkVersion>`,
+   `PackageManager` falls back to API 1 and the APK installs on anything,
+   including devices whose runtime cannot load a format-039 dex. It is worth
+   14 B. It changes nothing at runtime — `targetSdkVersion` still pins every
+   compatibility behaviour — and it was verified on Android 17 (API 37):
+   `dumpsys package` reports `minSdk=1 targetSdk=37`, the APK installs,
+   updates in place and relaunches, launches with no crash, and renders the
+   same edge-to-edge red screen. Set `DROP_MIN_SDK = False` in
+   `tools/manifest_golf.py` to keep the declared floor. One tooling side
+   effect: `apksigner verify` with no explicit `--min-sdk-version` reads the
+   missing floor as 1 and then demands a v1 JAR signature this APK
+   deliberately does not have (`Missing META-INF/MANIFEST.MF`), so
+   `tools/release.py` passes `--min-sdk-version 37` and verifies v2 cleanly.
 9. **R8/D8 metadata is removed from `classes.dex`** (`tools/dex_golf.py`,
    wired into `optimize_sign.py`; disable with `--no-dex-golf`). R8 embeds an
    unreferenced ~200 B provenance marker (`~~R8{...}`, no flag disables it)
@@ -226,8 +247,8 @@ A checklist of the techniques used (full details live in each file):
    (`tools/optimize_sign.py`; needs the optional `pip install zopfli`,
    disable with `--no-zopfli`). Zopfli emits plain DEFLATE, so Android
    decompresses it unchanged — it simply searches longer for a smaller
-   stream than zlib. It takes the signed APK from 2,078 B (zlib -9 only) to
-   2,028 B: `classes.dex` 770 → 735 B and `AndroidManifest.xml` 507 → 492 B
+   stream than zlib. It takes the signed APK from 2,063 B (zlib -9 only) to
+   2,014 B: `classes.dex` 770 → 735 B and `AndroidManifest.xml` 492 → 478 B
    deflated. The search parameters are tuned on these exact payloads
    (`ZOPFLI_ITERATIONS = 1000`, `ZOPFLI_BLOCKSPLITTING_MAX = 2`); the earlier
    `blocksplittingmax = 1` was optimal for the pre-dex-golf 1632 B dex and
@@ -254,7 +275,9 @@ A checklist of the techniques used (full details live in each file):
    complaint, but `apksigner` — the same apksig code the platform verifier is
    built from — rejects it as a malformed certificate, so it is not offered.
 
-Nothing here changes behaviour or the package name — the app on your screen
+Nothing here changes behaviour or the package name (the one dropped attribute
+Android does read, `minSdkVersion`, affects only which devices may install
+the APK) — the app on your screen
 is byte-for-byte the same logic as the plain Gradle build. (The launcher
 icon color is the only visual choice left to you: `holo_red_light` is used
 so it costs zero bytes, but any `@android:color/…` or your own drawable
@@ -275,8 +298,8 @@ where it got that far — offered to a Pixel 7a on Android 17:
 | A class name shorter than `a.a` | ~4 B | Already minimal: `-repackageclasses 'a'` yields the descriptor `La/a;`. A root-package class (`-repackageclasses ''`) could only be reached as `ca.justinmo.r.a`, which is longer. |
 
 The remaining semantic switches are real bytes, but they change what the app
-*is*, so they are off by default. Their exact measured cost in the signed
-APK:
+*is*, so all but one are off by default. Their exact measured cost in the
+signed APK:
 
 | Manifest attribute | Bytes saved if dropped | Price |
 |---|---|---|
@@ -285,10 +308,10 @@ APK:
 | `android:icon` | 19 B | the default system icon instead of the red one |
 | `android:targetSdkVersion` | 17 B | **changes behaviour**: the app would run in legacy compatibility mode |
 | `android:versionCode` | 15 B | `versionCode` becomes 0, and `adb install -r` then refuses the next build as a downgrade |
-| `android:minSdkVersion` | 14 B | the APK claims API 1+, so it installs on devices whose runtime cannot load a format-039 dex |
-| all six | 119 B | — |
+| `android:minSdkVersion` | 14 B | **dropped by default** (technique 8): the APK claims API 1+, so it installs on devices whose runtime cannot load a format-039 dex; set `DROP_MIN_SDK = False` to keep the floor |
+| the other five | 105 B | — |
 
-After that there is no slack left to find: the other 801 B of the 2,028 B APK
+After that there is no slack left to find: the other 801 B of the 2,014 B APK
 are the v2 signing block (567 B — 266 B certificate, 70 B ECDSA signature,
 91 B public key, the rest framing) and the ZIP container itself (234 B of
 local headers, central directory and EOCD for exactly two entries).
@@ -298,6 +321,7 @@ local headers, central directory and EOCD for exactly two entries).
 | | |
 |---|---|
 | Package | `ca.justinmo.r` |
-| minSdk / target / compile | 37 / 37 / 37 |
-| Signature scheme | APK Signature Scheme v2 only (fine for minSdk ≥ 24) |
+| minSdk | 37 at build time, **not declared in the shipped APK** (technique 8) — the platform falls back to 1 |
+| target / compile | 37 / 37 |
+| Signature scheme | APK Signature Scheme v2 only (fine for minSdk ≥ 24); verify with `apksigner verify --min-sdk-version 37`, since apksigner otherwise reads the missing floor as 1 and demands a v1 signature |
 | Permissions | none (window brightness + keep-screen-on need none) |
