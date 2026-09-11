@@ -6,10 +6,17 @@ without changing the application package name, the launcher icon, or any
 runtime behaviour:
 
   * drops META-INF/com/android/build/gradle/app-metadata.properties
-  * deflates classes.dex / AndroidManifest.xml as small as the compressor can
-    go: zlib -9, or Zopfli when the optional `zopfli` package is installed
-    (~4% off the final APK; ApkGolf-style, run before signing); disable Zopfli
-    with --no-zopfli.  (Gradle stores classes.dex uncompressed.)
+  * drops any v1 JAR signature left in the input (META-INF/MANIFEST.MF,
+    *.SF/*.RSA/*.DSA/*.EC).  Gradle signs the release variant with the debug
+    key in this project, so the input APK can carry a throwaway signature
+    that is invalidated by the repack anyway; the output is re-signed v2-only
+    below.  minSdk 37 means AGP emits no v1 files today, so this normally
+    finds nothing -- it only matters if the min SDK ever drops below 24.
+  * deflates classes.dex / AndroidManifest.xml with Zopfli (~4% off the final
+    APK; ApkGolf-style, run before signing).  Zopfli is required: the tool
+    refuses to run without it rather than silently shipping the larger
+    zlib -9 stream, which only --no-zopfli asks for explicitly.  (Gradle
+    stores classes.dex uncompressed.)
   * re-encodes AndroidManifest.xml smaller (tools/manifest_golf.py): drops
     aapt2-injected informational attributes (versionName, compileSdkVersion,
     platformBuildVersion*, extractNativeLibs) and rebuilds the string pool as
@@ -49,13 +56,15 @@ Options:
                          (default: re-encode it smaller; see tools/manifest_golf.py)
   --no-dex-golf          keep the R8/D8 metadata strings in classes.dex
                          (default: zero them; see tools/dex_golf.py)
-  --no-zopfli            deflate with zlib -9 only (skip Zopfli even if installed)
+  --no-zopfli            deflate with zlib -9 only instead of Zopfli -- also the
+                         only way to run without the mandatory `zopfli` package
+                         (the APK comes out ~49 B larger)
   --work-dir <dir>       put (and keep) the intermediate APKs here instead of
                          in a temporary directory that is deleted afterwards
 
 Output goes through <output.apk> only after every step succeeds.
-Requires the python `cryptography` package for --sign, and optionally the
-`zopfli` package (pip install zopfli) for the smallest possible DEFLATE.
+Requires the python `cryptography` package for --sign and the `zopfli`
+package (pip install zopfli) for the default, smallest possible DEFLATE.
 """
 import argparse
 import contextlib
@@ -71,9 +80,11 @@ import zlib
 import manifest_golf  # same-directory helper; see tools/manifest_golf.py
 import dex_golf  # same-directory helper; see tools/dex_golf.py
 
-try:  # optional: Zopfli beats zlib -9 by ~3-6% on these payloads (ApkGolf-style)
+try:  # required for the default path: Zopfli beats zlib -9 on these payloads
     import zopfli.zlib as _zopfli_zlib
-except ImportError:  # not installed -- zlib -9 is still used
+except ImportError:
+    # Optional at import time only so --no-zopfli (zlib -9) can still run on a
+    # machine without the package; main() rejects the default path without it.
     _zopfli_zlib = None
 
 # Both tuned by measurement on the two payloads here (dex 1360 B, manifest
@@ -84,7 +95,19 @@ except ImportError:  # not installed -- zlib -9 is still used
 ZOPFLI_ITERATIONS = 1000
 ZOPFLI_BLOCKSPLITTING_MAX = 2
 
+# Zopfli is a required dependency for every build that does not ask for
+# --no-zopfli, so its absence aborts: silently falling back to zlib -9 would
+# ship an APK ~49 B larger than the README's numbers.
+ZOPFLI_MISSING = (
+    "the mandatory `zopfli` package is not installed\n"
+    "  install it:            pip install zopfli\n"
+    "  or accept a larger APK: --no-zopfli (zlib -9 only)")
+
 APP_METADATA = "META-INF/com/android/build/gradle/app-metadata.properties"
+# v1 JAR signature entries: a Gradle-signed input may carry them (see the
+# module docstring); the repack invalidates them and the output is re-signed.
+V1_SIGNATURE = re.compile(
+    r"META-INF/(?:MANIFEST\.MF|[^/]+\.(?:SF|RSA|DSA|EC))$", re.IGNORECASE)
 ARSC = "resources.arsc"
 STORED = {ARSC}
 MANIFEST = "AndroidManifest.xml"
@@ -117,17 +140,25 @@ def newest_build_tools(sdk):
 
 
 def _raw_deflate(data, allow_zopfli):
-    """Smallest raw DEFLATE stream for `data`: zlib -9, or Zopfli when available."""
+    """Smallest raw DEFLATE stream for `data`: Zopfli, or zlib -9 on request.
+
+    Zopfli is required unless the caller opts out explicitly with
+    allow_zopfli=False, so a missing package is loud instead of quietly
+    costing APK size.
+    """
     comp = zlib.compressobj(9, zlib.DEFLATED, -15)
     best = comp.compress(data) + comp.flush()
-    if allow_zopfli and _zopfli_zlib is not None:
-        # zopfli.zlib frames its output with a 2-byte header + adler32; a ZIP
-        # entry wants the bare DEFLATE stream in between.
-        z = _zopfli_zlib.compress(
-            data, numiterations=ZOPFLI_ITERATIONS,
-            blocksplittingmax=ZOPFLI_BLOCKSPLITTING_MAX)[2:-4]
-        if len(z) < len(best):
-            best = z
+    if not allow_zopfli:
+        return best
+    if _zopfli_zlib is None:
+        raise RuntimeError(ZOPFLI_MISSING)
+    # zopfli.zlib frames its output with a 2-byte header + adler32; a ZIP
+    # entry wants the bare DEFLATE stream in between.
+    z = _zopfli_zlib.compress(
+        data, numiterations=ZOPFLI_ITERATIONS,
+        blocksplittingmax=ZOPFLI_BLOCKSPLITTING_MAX)[2:-4]
+    if len(z) < len(best):
+        best = z
     return best
 
 
@@ -179,6 +210,10 @@ def optimize(in_apk, out_apk, golf_manifest=True, golf_dex=True, use_zopfli=True
         for info in zin.infolist():
             if info.filename == APP_METADATA:
                 print(f"  drop {info.filename} ({info.file_size} B)")
+                continue
+            if V1_SIGNATURE.match(info.filename):
+                print(f"  drop {info.filename} ({info.file_size} B, stale v1 "
+                      "signature from the input; output is signed v2-only)")
                 continue
             if info.filename == ARSC and info.file_size < 100:
                 print(f"  drop {info.filename} ({info.file_size} B, empty "
@@ -233,12 +268,17 @@ def main():
     ap.add_argument("--no-dex-golf", action="store_true",
                     help="keep R8/D8 metadata strings in classes.dex")
     ap.add_argument("--no-zopfli", action="store_true",
-                    help="deflate with zlib -9 only (skip Zopfli even if installed)")
+                    help="deflate with zlib -9 only instead of Zopfli -- also "
+                         "the only way to run without the mandatory `zopfli` "
+                         "package (the APK comes out larger)")
     ap.add_argument("--build-tools", help="override build-tools dir")
     ap.add_argument("--work-dir",
                     help="keep intermediates in this directory instead of a "
                          "temporary one")
     args = ap.parse_args()
+
+    if not args.no_zopfli and _zopfli_zlib is None:
+        sys.exit(ZOPFLI_MISSING)
 
     if not os.path.exists(args.input):
         sys.exit(f"input not found: {args.input}")

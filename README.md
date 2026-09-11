@@ -1,57 +1,47 @@
 # Rouge
 
-**A full-screen red Android app that turns horizontal touch/drag into a
-brightness control — shipped as a ~2.0 KB signed APK.**
+A minimum viable android app that provides functionality with an ultra optizied apk. The app consists in a red full screen with adjustable brightness. This is used to light yourself in the dark with minimum impact to night vision.
 
-`ca.justinmo.r` · targetSdk 37 · no minSdk in the shipped APK (technique 8) · zero dependencies
+This project is also an exercise in APK golfing inspired by [ApkGolf](https://github.com/fractalwrench/ApkGolf).
 
-Rouge is both a tiny utility and an exercise in aggressive APK size golf:
-the release APK you install is a hand-tuned ~2.0 KB, built with standard
-Android tooling plus a byte-tight, pure-Python APK Signature Scheme v2
-signer — inspired by [ApkGolf](https://github.com/fractalwrench/ApkGolf),
-but without sacrificing the launcher icon, the UI, or any functionality.
+The resulting APK is currently standing at 2005 bytes.
 
-## What it does
+## Constraints 
 
-Open Rouge and you get an edge-to-edge red screen (system bars hidden,
-screen kept on). Touch anywhere and drag left/right:
-
-- the **brightness of the app window** follows your finger's horizontal
-  position (`0%` at the left edge → `100%` at the right edge)
-
-It is intentionally a single self-contained screen — there is no settings
-UI, no network, no dependencies.
+The app must have:
+* An icon
+* A launcher label
+* One activity
+* Touch interactivity
+* Some kind of usefulness
 
 ## How small is it really?
 
-Measured on this repository (`gradlew :app:assembleRelease` + `tools/release.py`):
-
 | Artifact | Size |
 |---|---|
-| Typical Gradle+AppCompat hello world | ~1.5 MB |
-| This app, plain `assembleRelease` (unsigned) | 2,967 B |
-| After `tools/optimize_sign.py` (optimized, unsigned) | 1,447 B |
-| **Signed release APK (with Zopfli, technique 10)** | **2,014 B** |
-| Signed release APK (Zopfli not installed: zlib -9 only) | 2,063 B |
-| Signed with a minimal certificate (`--recert`, technique 11) | 2,005 B |
+| `./gradlew assembleRelease` (signed with debug key) | 7063 bytes |
+| `python tools/release.py` (signed with generated key) | **2005 bytes** |
 
-The last two rows are the same pipeline with one ingredient missing, so a
-machine without Zopfli builds the 2,063 B APK. Signing is the other jitter
-source: the ECDSA signature is DER-encoded and its length varies by a byte or
-two, so a signed build measures 2,014 B ±1 B.
+
+The last row is that pipeline with the optimize/sign steps that produce
+`rouge_final.apk`. Those steps deflate with Zopfli, which `optimize_sign.py`
+requires: 2,054 B is what `--no-zopfli` costs (zlib -9 only), so that build
+only happens on request. Signing is the other jitter source: the ECDSA
+signature is DER-encoded and its length varies by a byte or two, so a signed
+build measures 2,005 B ±1 B.
 
 A stock `apksigner` run would pad the signing block and the central
 directory to 4 KB boundaries, adding several KB of dead weight to an APK
 this size. The in-repo signer (`tools/v2sign.py`) does not.
 
-What's inside the 2,014 B — and note what's *not* there:
+What's inside the 2,005 B — and note what's *not* there:
 
 | Component | Bytes |
 |---|---|
 | `classes.dex` (R8-minified, metadata stripped, deflated) | 735 |
 | `AndroidManifest.xml` (compiled, deflated, golfed) | 478 |
 | ~~`resources.arsc`~~ | **none** |
-| v2 signing block (tight, EC P-256 + 233–266 B cert) | 567 |
+| v2 signing block (tight, EC P-256 + 257 B cert) | 558 |
 | ZIP local headers + central directory + EOCD (2 entries) | 234 |
 
 The manifest golfing step (technique 8) is what takes the compiled
@@ -87,10 +77,11 @@ tools/
 - **Android SDK** with `platforms;android-37` and recent `build-tools`
   (path goes in `local.properties` → `sdk.dir`, or `ANDROID_HOME`)
 - **Python 3.9+** with the [`cryptography`](https://pypi.org/project/cryptography/)
-  package (key generation and signing; the repack step alone needs no extras)
-  and, optionally, [`zopfli`](https://pypi.org/project/zopfli/) for the
-  smallest possible DEFLATE (see technique 10; without it the build still
-  works, just 49 B larger — 2,063 B instead of 2,014 B)
+  package (key generation and signing) and the
+  [`zopfli`](https://pypi.org/project/zopfli/) package, which
+  `optimize_sign.py` requires for the smallest possible DEFLATE
+  (see technique 10; a zlib -9-only build is 49 B larger — 2,054 B instead of
+  2,005 B — and only happens when you explicitly pass `--no-zopfli`)
 
 ## Build & install
 
@@ -105,7 +96,7 @@ Useful flags:
 
 ```bash
 python tools/release.py --no-install        # just produce the signed APK
-python tools/release.py --no-build          # reuse the existing unsigned APK
+python tools/release.py --no-build          # reuse the APK Gradle already built
 python tools/release.py --ks your.p12 --ks-pass secret   # your own key
 python tools/release.py --recert            # re-issue the certificate smaller
 ```
@@ -115,23 +106,34 @@ Manual equivalent:
 ```bash
 ./gradlew :app:assembleRelease
 python tools/optimize_sign.py \
-    app/build/outputs/apk/release/app-release-unsigned.apk \
+    app/build/outputs/apk/release/app-release.apk \
     rouge_final.apk \
     --sign --ks your.p12 --ks-pass secret
 adb install -r rouge_final.apk
 ```
 
+`release.py` finds the Gradle output through AGP's
+`app/build/outputs/apk/release/output-metadata.json` rather than hardcoding a
+file name: the release build type carries `signingConfig = debug`, so Gradle
+writes `app-release.apk` (an installable 7,063 B APK), not
+`app-release-unsigned.apk`. The throwaway debug signature is discarded by the
+repack, which re-signs the archive v2-only with your own key — the file the
+golfing pipeline emits is 2,005 B regardless.
+
 `optimize_sign.py` also takes `--work-dir DIR` to keep the intermediate
 repacked/aligned APKs for inspection instead of deleting them, and switches
-for turning each golfing step off (`--no-dex-golf`, `--no-manifest-golf`,
-`--no-zopfli`) so a suspect build can be bisected.
+for turning each golfing step off (`--no-dex-golf`, `--no-manifest-golf`)
+so a suspect build can be bisected. `--no-zopfli` is the same kind of switch
+for the compressor: it drops to zlib -9 (49 B larger on this APK) and is also
+the only way to run without the otherwise-mandatory `zopfli` package.
 
 Outputs are:
 
-- `app/build/outputs/apk/release/app-release-unsigned.apk` — plain Gradle
-  output
+- `app/build/outputs/apk/release/app-release.apk` — plain Gradle output,
+  signed with the debug key (7,063 B); it is `app-release-unsigned.apk` if the
+  release build type ever loses its `signingConfig`
 - `rouge_final.apk`, in the repository root — optimized + v2-signed APK
-  (2,014 B; 2,063 B without the optional Zopfli). This is the file
+  (2,005 B; 2,054 B with `--no-zopfli`). This is the file
   `tools/release.py` writes by default; `--apk-out FILE` sends it elsewhere
 
 Launch it with `adb shell am start -n ca.justinmo.r/a.a` (or just run
@@ -246,17 +248,17 @@ A checklist of the techniques used (full details live in each file):
    install; the only observable difference is that the SourceFile a crash
    trace shows is a one-letter junk run instead of the map-id hash.
 10. **Every deflated entry is compressed with Zopfli**
-   (`tools/optimize_sign.py`; needs the optional `pip install zopfli`,
-   disable with `--no-zopfli`). Zopfli emits plain DEFLATE, so Android
-   decompresses it unchanged — it simply searches longer for a smaller
-   stream than zlib. It takes the signed APK from 2,063 B (zlib -9 only) to
-   2,014 B: `classes.dex` 770 → 735 B and `AndroidManifest.xml` 492 → 478 B
-   deflated. The search parameters are tuned on these exact payloads
-   (`ZOPFLI_ITERATIONS = 1000`, `ZOPFLI_BLOCKSPLITTING_MAX = 2`); the earlier
-   `blocksplittingmax = 1` was optimal for the pre-dex-golf 1632 B dex and
-   silently costs 6 B now, so re-measure them if the payloads change shape.
-   Most of the remaining bytes are the v2 signing block and ZIP headers,
-   which compression cannot touch.
+   (`tools/optimize_sign.py`; requires `pip install zopfli` and refuses to run
+   without it unless `--no-zopfli` asks for zlib -9 instead). Zopfli emits
+   plain DEFLATE, so Android decompresses it unchanged — it simply searches
+   longer for a smaller stream than zlib. It takes the signed APK from
+   2,054 B (zlib -9 only) to 2,005 B: `classes.dex` 770 → 735 B and
+   `AndroidManifest.xml` 492 → 478 B deflated. The search parameters are
+   tuned on these exact payloads (`ZOPFLI_ITERATIONS = 1000`,
+   `ZOPFLI_BLOCKSPLITTING_MAX = 2`); the earlier `blocksplittingmax = 1` was
+   optimal for the pre-dex-golf 1632 B dex and silently costs 6 B now, so
+   re-measure them if the payloads change shape. Most of the remaining bytes
+   are the v2 signing block and ZIP headers, which compression cannot touch.
 11. **The signing certificate is built by hand** (`tools/mincert.py`; used
    when `release.py` creates a keystore, and by `release.py --recert` for an
    existing one). The certificate is half of the v2 signing block, so its
@@ -313,8 +315,8 @@ signed APK:
 | `android:minSdkVersion` | 14 B | **dropped by default** (technique 8): the APK claims API 1+, so it installs on devices whose runtime cannot load a format-039 dex; set `DROP_MIN_SDK = False` to keep the floor |
 | the other five | 105 B | — |
 
-After that there is no slack left to find: the other 801 B of the 2,014 B APK
-are the v2 signing block (567 B — 266 B certificate, 70 B ECDSA signature,
+After that there is no slack left to find: the other 792 B of the 2,005 B APK
+are the v2 signing block (558 B — 257 B certificate, 70 B ECDSA signature,
 91 B public key, the rest framing) and the ZIP container itself (234 B of
 local headers, central directory and EOCD for exactly two entries).
 

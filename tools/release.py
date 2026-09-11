@@ -17,6 +17,10 @@ Defaults:
   apk out  : <repo>/rouge_final.apk                (override with --apk-out)
 
 Notes:
+  * The Gradle input is whatever `:app:assembleRelease` produced, found
+    through AGP's app/build/outputs/apk/release/output-metadata.json -- the
+    release build type carries a signingConfig (the debug key), so that file
+    is app-release.apk, not app-release-unsigned.apk.
   * The certificate is built by hand (tools/mincert.py): a version 1, no
     extensions, one-character-CommonName, UTCTime certificate.  It is 257 B
     where Android Studio/keytool would produce 700-900 B and
@@ -33,6 +37,7 @@ Notes:
 """
 import argparse
 import hashlib
+import json
 import os
 import re
 import secrets
@@ -53,10 +58,14 @@ TOOLS = os.path.join(ROOT, "tools")
 OPTIMIZE_SIGN = os.path.join(TOOLS, "optimize_sign.py")
 DEFAULT_KS = os.path.join(ROOT, "build", "keys", "release.p12")
 DEFAULT_OUT = os.path.join(ROOT, "rouge_final.apk")
+RELEASE_DIR = os.path.join(ROOT, "app", "build", "outputs", "apk", "release")
 
 
 def sh(cmd, **kw):
     print("  $ " + " ".join(cmd) if isinstance(cmd, list) else "  $ " + cmd)
+    # The child writes to the same fd, so flush our buffered lines first or
+    # they show up after its output when stdout is a pipe (not a terminal).
+    sys.stdout.flush()
     return subprocess.run(cmd, check=True, **kw)
 
 
@@ -100,13 +109,55 @@ def tool(name, *dirs):
     found = shutil.which(name)
     if found:
         return found
+    # Android ships some tools as batch files on Windows -- apksigner.bat is
+    # the one this script needs -- while adb and zipalign are .exe, so try
+    # every extension the SDK uses rather than only .exe.
+    suffixes = ("", ".exe", ".bat", ".cmd") if os.name == "nt" else ("",)
     for d in dirs:
         if not d:
             continue
-        cand = os.path.join(d, name + (".exe" if os.name == "nt" else ""))
-        if os.path.exists(cand):
-            return cand
+        for suffix in suffixes:
+            cand = os.path.join(d, name + suffix)
+            if os.path.exists(cand):
+                return cand
     return None
+
+
+def release_apk():
+    """The APK `:app:assembleRelease` wrote, whatever AGP decided to call it.
+
+    AGP names the file after the release variant's signing config:
+    `app-release.apk` while the release build type carries a `signingConfig`
+    (this project points it at the debug key so a plain `assembleRelease`
+    produces an installable APK, see app/build.gradle.kts) and
+    `app-release-unsigned.apk` when it does not.  Hardcoding either name
+    breaks the moment that config changes, so AGP's own
+    output-metadata.json is authoritative here, with the two known names and
+    finally any APK in the directory as fallbacks.
+    """
+    meta = os.path.join(RELEASE_DIR, "output-metadata.json")
+    names = []
+    if os.path.exists(meta):
+        try:
+            with open(meta, encoding="utf-8") as fh:
+                names = [e.get("outputFile") for e in json.load(fh)["elements"]]
+        except (ValueError, KeyError, TypeError, AttributeError):
+            names = []  # unreadable/unknown shape: fall through to the names
+    for name in names:
+        cand = os.path.join(RELEASE_DIR, name) if name else None
+        if cand and os.path.exists(cand):
+            return cand
+
+    found = [p for p in (os.path.join(RELEASE_DIR, n) for n in (
+        "app-release.apk", "app-release-unsigned.apk")) if os.path.exists(p)]
+    if not found and os.path.isdir(RELEASE_DIR):
+        found = [os.path.join(RELEASE_DIR, n)
+                 for n in os.listdir(RELEASE_DIR) if n.endswith(".apk")]
+    if not found:
+        sys.exit(f"release APK not found in {RELEASE_DIR}\n"
+                 "       run without --no-build (or ./gradlew "
+                 ":app:assembleRelease) first")
+    return max(found, key=os.path.getmtime)
 
 
 def _minimal_cert(key):
@@ -178,7 +229,9 @@ def main():
     ap.add_argument("--ks-pass", default=None)
     ap.add_argument("--apk-out", default=DEFAULT_OUT)
     ap.add_argument("--package", default=None, help="override applicationId")
-    ap.add_argument("--no-build", action="store_true")
+    ap.add_argument("--no-build", action="store_true",
+                    help="reuse the APK already in "
+                         "app/build/outputs/apk/release instead of rebuilding")
     ap.add_argument("--no-install", action="store_true")
     ap.add_argument("--recert", action="store_true",
                     help="re-issue the keystore certificate as a minimal one "
@@ -195,7 +248,7 @@ def main():
             return
 
     if not args.no_build:
-        print("[1/4] building release APK")
+        print("[1/4] building release APK", flush=True)
         gradlew = os.path.join(ROOT, "gradlew" + (".bat" if os.name == "nt" else ""))
         cmd = f'"{gradlew}" :app:assembleRelease --console=plain'
         if os.name == "nt":
@@ -203,37 +256,44 @@ def main():
         else:
             sh([gradlew, ":app:assembleRelease", "--console=plain"], cwd=ROOT)
 
-    unsigned = os.path.join(
-        ROOT, "app", "build", "outputs", "apk", "release", "app-release-unsigned.apk")
-    if not os.path.exists(unsigned):
-        sys.exit(f"release APK not found at {unsigned} (build first)")
+    gradle_apk = release_apk()
+    print(f"  gradle output: {os.path.relpath(gradle_apk, ROOT)}")
 
     print("[2/4] optimizing + v2-signing")
-    sh([sys.executable, OPTIMIZE_SIGN, unsigned, args.apk_out,
+    # The Gradle APK may already be signed (the release build type uses the
+    # debug key); optimize_sign.py rebuilds the archive from its entries, so
+    # that throwaway signature never reaches the output.
+    sh([sys.executable, OPTIMIZE_SIGN, gradle_apk, args.apk_out,
         "--sign", "--ks", ks, "--ks-pass", ks_pass])
 
-    print("[3/4] verifying signature")
+    print("[3/4] verifying signature", flush=True)
     sdk = sdk_dir()
+    apksigner = None
     if sdk:
-        bt = newest_build_tools(sdk)
-        apksigner = tool("apksigner", bt)
-        if apksigner:
-            # The shipped APK declares no minSdkVersion (the manifest golf step
-            # drops it -- see tools/manifest_golf.py), so apksigner falls back
-            # to minSdk 1 and then demands a v1 JAR signature this APK
-            # deliberately does not have ("Missing META-INF/MANIFEST.MF").
-            # Pin the min SDK so it verifies the v2 scheme that is present.
-            subprocess.run([apksigner, "verify", "--min-sdk-version", "37",
-                            "--print-certs", args.apk_out], check=True)
+        try:
+            apksigner = tool("apksigner", newest_build_tools(sdk))
+        except OSError:  # SDK without a build-tools/ directory
+            apksigner = None
+    if not apksigner:
+        # Say so rather than passing silently: a skip that looks like a pass
+        # is how a broken signature ships.
+        print("  (apksigner not found; signature left unverified)")
     else:
-        print("  (SDK not found; skipped apksigner verify)")
+        # The shipped APK declares no minSdkVersion (the manifest golf step
+        # drops it -- see tools/manifest_golf.py), so apksigner falls back
+        # to minSdk 1 and then demands a v1 JAR signature this APK
+        # deliberately does not have ("Missing META-INF/MANIFEST.MF").
+        # Pin the min SDK so it verifies the v2 scheme that is present.
+        subprocess.run([apksigner, "verify", "--min-sdk-version", "37",
+                        "--verbose", "--print-certs", args.apk_out],
+                       check=True)
 
     size = os.path.getsize(args.apk_out)
     print(f"[ok] signed APK: {args.apk_out} ({size} bytes)")
 
     if args.no_install:
         return
-    print("[4/4] installing via adb")
+    print("[4/4] installing via adb", flush=True)
     sdk = sdk_dir()
     adb = tool("adb", sdk and os.path.join(sdk, "platform-tools"))
     if not adb:
@@ -263,12 +323,16 @@ def main():
     for line in resolve.stdout.splitlines():
         line = line.strip()
         if line and " " not in line and "/" in line:
-            comp = line  # e.g. ca.justinmo.r/.A
+            comp = line  # e.g. ca.justinmo.r/a.a
     if comp:
         launched = sh_out([adb, "shell", "am", "start", "-n", comp]).returncode == 0
     if not launched:
+        # Fallback for a shell where resolve-activity said nothing: the
+        # manifest declares <activity android:name="a.a">, a root-package
+        # class, so the component is pkg/a.a (not pkg/.A -- the leading dot
+        # would mean "A in the app's package", which does not exist).
         launched = sh_out(
-            [adb, "shell", "am", "start", "-n", f"{pkg}/.A"]).returncode == 0
+            [adb, "shell", "am", "start", "-n", f"{pkg}/a.a"]).returncode == 0
     if launched:
         print(f"[ok] launched {pkg}")
     else:
