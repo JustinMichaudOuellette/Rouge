@@ -6,6 +6,22 @@ This project is also an exercise in APK golfing inspired by [ApkGolf](https://gi
 
 The resulting APK is currently standing at 2005 bytes.
 
+## Downloads
+
+The easiest way to get Rouge is by grabbing the latest release directly from GitHub.
+
+<div align="center">
+  <a href="https://github.com/JustinMichaudOuellette/Rouge/releases/latest"><img alt="Get it on GitHub" height="100" src="https://raw.githubusercontent.com/JustinMichaudOuellette/Lumiere/main/assets/images/badge_github.png"></a>
+</div>
+
+Each release carries one APK per minimum SDK: `rouge_final-min37.apk` (2,005 B)
+and `rouge_final-min34.apk` (2,033 B). Same app, different API floor — take the
+smaller one if your device runs Android 17 (API 37) or newer, and the `min34`
+build for Android 14–16 devices, which the `min37` dex is not compiled to load.
+Both install anywhere, because the shipped manifest declares no floor (technique 8
+below), so nothing but your device's API level stops you picking the wrong one.
+See [Minimum SDKs](#minimum-sdks) for why the lower floor is the larger file.
+
 ## Constraints 
 
 The app must have:
