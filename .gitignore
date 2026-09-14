@@ -10,7 +10,10 @@
 local.properties
 .kotlin/*
 app/release/*
-/rouge_final.apk
+# tools/release.py writes one optimized APK per --min-sdks level:
+# rouge_final-min37.apk, rouge_final-min34.apk, or rouge_final.apk for a
+# single level.
+/rouge_final*.apk
 .reasonix/*
 reasonix.toml
 tools/__pycache__/*

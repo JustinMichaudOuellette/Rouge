@@ -10,8 +10,10 @@ runtime behaviour:
     *.SF/*.RSA/*.DSA/*.EC).  Gradle signs the release variant with the debug
     key in this project, so the input APK can carry a throwaway signature
     that is invalidated by the repack anyway; the output is re-signed v2-only
-    below.  minSdk 37 means AGP emits no v1 files today, so this normally
-    finds nothing -- it only matters if the min SDK ever drops below 24.
+    below.  Every min SDK tools/release.py accepts is >= 24 (it refuses lower,
+    since v2 cannot be verified below API 24), so AGP emits no v1 files today
+    and this normally finds nothing -- it only matters if that floor is ever
+    lowered by hand.
   * deflates classes.dex / AndroidManifest.xml with Zopfli (~4% off the final
     APK; ApkGolf-style, run before signing).  Zopfli is required: the tool
     refuses to run without it rather than silently shipping the larger

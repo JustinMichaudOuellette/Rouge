@@ -21,14 +21,21 @@ The app must have:
 |---|---|
 | `./gradlew assembleRelease` (signed with debug key) | 7063 bytes |
 | `python tools/release.py` (signed with generated key) | **2005 bytes** |
+| `python tools/release.py --min-sdks 34` (minSdk 34 variant) | 2033 bytes |
 
-
-The last row is that pipeline with the optimize/sign steps that produce
-`rouge_final.apk`. Those steps deflate with Zopfli, which `optimize_sign.py`
+The second row is that pipeline with the optimize/sign steps that produce
+`rouge_final-min37.apk`. Those steps deflate with Zopfli, which `optimize_sign.py`
 requires: 2,054 B is what `--no-zopfli` costs (zlib -9 only), so that build
 only happens on request. Signing is the other jitter source: the ECDSA
 signature is DER-encoded and its length varies by a byte or two, so a signed
 build measures 2,005 B ±1 B.
+
+The third row is the same pipeline at a lower API floor, and it is 28 B
+*larger*, not smaller: R8/D8 compile against the declared `minSdk`, so
+`minSdk 34` yields a 1,676 B `classes.dex` where `minSdk 37` yields 1,632 B
+(see [Minimum SDKs](#minimum-sdks)). The floor is a real build input, which is
+why `release.py` builds one APK per level instead of assuming the newest one
+covers everyone.
 
 A stock `apksigner` run would pad the signing block and the central
 directory to 4 KB boundaries, adding several KB of dead weight to an APK
@@ -72,7 +79,8 @@ tools/
 release.p12                   signing keystore, generated on first run (gitignored)
 release.p12.pass              its random password (gitignored)
 release.p12.sha256            its certificate's SHA-256 fingerprint (for the Play Console)
-rouge_final.apk               the built APK (gitignored)
+rouge_final-min37.apk         the built APKs, one per min SDK (gitignored)
+rouge_final-min34.apk         (a single --min-sdks level writes rouge_final.apk)
 ```
 
 ## Requirements
@@ -99,7 +107,9 @@ python tools/release.py
 Useful flags:
 
 ```bash
-python tools/release.py --no-install        # just produce the signed APK
+python tools/release.py --no-install        # just produce the signed APKs
+python tools/release.py --min-sdks 37       # one variant, written to rouge_final.apk
+python tools/release.py --min-sdks 34,36,37 # one APK per API floor
 python tools/release.py --no-build          # reuse the APK Gradle already built
 python tools/release.py --ks your.p12 --ks-pass secret   # your own key
 python tools/release.py --recert            # re-issue the certificate smaller
@@ -108,12 +118,12 @@ python tools/release.py --recert            # re-issue the certificate smaller
 Manual equivalent:
 
 ```bash
-./gradlew :app:assembleRelease
+./gradlew :app:assembleRelease -PminSdk=37
 python tools/optimize_sign.py \
     app/build/outputs/apk/release/app-release.apk \
-    rouge_final.apk \
+    rouge_final-min37.apk \
     --sign --ks your.p12 --ks-pass secret
-adb install -r rouge_final.apk
+adb install -r rouge_final-min37.apk
 ```
 
 `release.py` finds the Gradle output through AGP's
@@ -136,12 +146,58 @@ Outputs are:
 - `app/build/outputs/apk/release/app-release.apk` — plain Gradle output,
   signed with the debug key (7,063 B); it is `app-release-unsigned.apk` if the
   release build type ever loses its `signingConfig`
-- `rouge_final.apk`, in the repository root — optimized + v2-signed APK
-  (2,005 B; 2,054 B with `--no-zopfli`). This is the file
-  `tools/release.py` writes by default; `--apk-out FILE` sends it elsewhere
+- `rouge_final-min37.apk` and `rouge_final-min34.apk`, in the repository
+  root — one optimized + v2-signed APK per min SDK (2,005 B and 2,033 B). With
+  a single `--min-sdks` value the path is `--apk-out` verbatim, so
+  `--min-sdks 37` writes `rouge_final.apk`; with several, the level is
+  inserted before the extension. `--apk-out FILE` moves the whole set
 
 Launch it with `adb shell am start -n ca.justinmo.r/a.a` (or just run
 `tools/release.py`, which installs and launches it for you).
+
+## Minimum SDKs
+
+`--min-sdks` takes a comma- or space-separated list of Android API levels
+(default `37,34`) and builds the release variant once per value by passing
+`-PminSdk=<n>` to Gradle. `app/build.gradle.kts` reads that property, so no
+file is edited between builds and a plain `./gradlew assembleRelease` still
+means `minSdk 37`.
+
+```bash
+python tools/release.py --min-sdks 37,34          # rouge_final-min37.apk + rouge_final-min34.apk
+python tools/release.py --min-sdks 34             # rouge_final.apk
+```
+
+The floor is not cosmetic — R8/D8 compile against it, so the dex really does
+change:
+
+| minSdk | `:app:assembleRelease` | `classes.dex` | signed APK |
+|---|---|---|---|
+| 37 | 7,063 B | 1,632 B | 2,005 B |
+| 34 | 7,111 B | 1,676 B | 2,033 B |
+
+Two details the loop has to get right, and does:
+
+- Every build writes the *same* Gradle path
+  (`app/build/outputs/apk/release/app-release.apk`), so each variant is
+  optimized and signed before the next build overwrites it. The APK's own
+  declared `minSdkVersion` is then read back out of its manifest and compared
+  with the level that was requested: an `app/build.gradle.kts` that stopped
+  reading `-PminSdk` would otherwise leave the loop signing the previous
+  iteration's APK under the new name, which is the one mistake it can make
+  silently.
+- Levels below API 24 are refused rather than clamped, because this pipeline
+  emits APK Signature Scheme v2 only and API 23 and below cannot verify it —
+  the APK would not install on the devices it was built for. Levels above
+  `compileSdk` are refused too.
+
+Only one variant can be installed at a time (they share the package name), so
+`release.py` installs the one matching the connected device: the highest built
+min SDK that is `<=` the device's `ro.build.version.sdk` — the most tightly
+optimized variant whose dex the device can still run — falling back to the
+lowest built variant, with a warning, when the device is older than all of
+them or its API level cannot be read. `--no-build` cannot produce several
+variants (the release directory holds one APK) and says so.
 
 ## Signing key
 
@@ -250,7 +306,8 @@ A checklist of the techniques used (full details live in each file):
    effect: `apksigner verify` with no explicit `--min-sdk-version` reads the
    missing floor as 1 and then demands a v1 JAR signature this APK
    deliberately does not have (`Missing META-INF/MANIFEST.MF`), so
-   `tools/release.py` passes `--min-sdk-version 37` and verifies v2 cleanly.
+   `tools/release.py` passes the level that variant was built for (37 or 34)
+   as `--min-sdk-version` and verifies v2 cleanly on each.
 9. **R8/D8 metadata is removed from `classes.dex`** (`tools/dex_golf.py`,
    wired into `optimize_sign.py`; disable with `--no-dex-golf`). R8 embeds an
    unreferenced ~200 B provenance marker (`~~R8{...}`, no flag disables it)
@@ -349,7 +406,7 @@ local headers, central directory and EOCD for exactly two entries).
 | | |
 |---|---|
 | Package | `ca.justinmo.r` |
-| minSdk | 37 at build time, **not declared in the shipped APK** (technique 8) — the platform falls back to 1 |
+| minSdk | 37 and 34 built (`--min-sdks`), each **not declared in the shipped APK** (technique 8) — the platform falls back to 1 on every variant |
 | target / compile | 37 / 37 |
-| Signature scheme | APK Signature Scheme v2 only (fine for minSdk ≥ 24); verify with `apksigner verify --min-sdk-version 37`, since apksigner otherwise reads the missing floor as 1 and demands a v1 signature |
+| Signature scheme | APK Signature Scheme v2 only (fine for minSdk ≥ 24, which is why `--min-sdks` refuses anything lower); verify with `apksigner verify --min-sdk-version 37` (or `34` for that variant), since apksigner otherwise reads the missing floor as 1 and demands a v1 signature |
 | Permissions | none (window brightness + keep-screen-on need none) |
